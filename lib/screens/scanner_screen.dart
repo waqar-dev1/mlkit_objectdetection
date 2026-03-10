@@ -28,6 +28,7 @@ class _ScannerScreenState extends State<ScannerScreen>
   final ObjectDetectorService _detectorService = ObjectDetectorService();
   List<DetectedObject> _detectedObjects = [];
   Size? _imageSize;
+  InputImageRotation _rotation = InputImageRotation.rotation0deg;
 
   // State
   bool _hasPermission = false;
@@ -96,7 +97,7 @@ class _ScannerScreenState extends State<ScannerScreen>
       ResolutionPreset.high,
       enableAudio: false,
       imageFormatGroup: Platform.isAndroid
-          ? ImageFormatGroup.nv21
+          ? ImageFormatGroup.yuv420
           : ImageFormatGroup.bgra8888,
     );
 
@@ -147,12 +148,16 @@ class _ScannerScreenState extends State<ScannerScreen>
     final inputImage = CameraUtils.cameraImageToInputImage(image, camera);
     if (inputImage == null) return;
 
+    // Capture the rotation used so the painter can correct coordinates.
+    final rotation = CameraUtils.rotationForCamera(camera);
+
     _detectorService.processImage(inputImage).then((objects) {
       if (!mounted || objects == null) return;
 
       setState(() {
         _detectedObjects = objects;
         _imageSize = Size(image.width.toDouble(), image.height.toDouble());
+        if (rotation != null) _rotation = rotation;
       });
     });
   }
@@ -230,7 +235,7 @@ class _ScannerScreenState extends State<ScannerScreen>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.camera_alt_rounded, color: Colors.white38, size: 64),
+            Icon(Icons.camera_alt_outlined, color: Colors.white38, size: 64),
             const SizedBox(height: 20),
             Text(
               _errorMessage!,
@@ -272,7 +277,8 @@ class _ScannerScreenState extends State<ScannerScreen>
           CustomPaint(
             painter: DocumentOverlayPainter(
               detectedObjects: _detectedObjects,
-              imageSize: _imageSize!,
+              absoluteImageSize: _imageSize!,
+              rotation: _rotation,
               isFrontCamera: _cameras![_selectedCameraIndex].lensDirection ==
                   CameraLensDirection.front,
             ),
@@ -464,8 +470,8 @@ class _ScannerScreenState extends State<ScannerScreen>
               Text(
                 isDetecting
                     ? count == 1
-                        ? '1 object detected'
-                        : '$count objects detected'
+                    ? '1 object detected'
+                    : '$count objects detected'
                     : 'Scanning…',
                 style: TextStyle(
                   color: isDetecting ? const Color(0xFF00E676) : Colors.white54,

@@ -1,14 +1,31 @@
 import 'package:flutter/material.dart';
 import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
 
+/// Paints ML Kit bounding boxes correctly over a [CameraPreview] widget.
+///
+/// Coordinate pipeline:
+///   ML Kit bbox  →  (rotate if needed)  →  scale to canvas  →  mirror if front cam
+///
+/// Key insight: ML Kit returns coordinates in the *rotated* image space
+/// (i.e. after applying [InputImageRotation]).  On a portrait Android device
+/// the sensor delivers landscape frames (e.g. 1280×720) but ML Kit already
+/// rotates them, so the logical image size we should scale against is
+/// 720×1280 — height and width are swapped.
 class DocumentOverlayPainter extends CustomPainter {
   final List<DetectedObject> detectedObjects;
-  final Size imageSize;
+
+  /// Raw sensor frame size (width × height) as delivered by CameraImage.
+  final Size absoluteImageSize;
+
+  /// The rotation that was applied when building the InputImage.
+  final InputImageRotation rotation;
+
   final bool isFrontCamera;
 
   DocumentOverlayPainter({
     required this.detectedObjects,
-    required this.imageSize,
+    required this.absoluteImageSize,
+    required this.rotation,
     this.isFrontCamera = false,
   });
 
@@ -16,258 +33,159 @@ class DocumentOverlayPainter extends CustomPainter {
   void paint(Canvas canvas, Size canvasSize) {
     if (detectedObjects.isEmpty) return;
 
-    final scaleX = canvasSize.width / imageSize.width;
-    final scaleY = canvasSize.height / imageSize.height;
-
     for (final object in detectedObjects) {
-      final boundingBox = object.boundingBox;
-
-      // Scale the bounding box to the canvas size
-      double left = boundingBox.left * scaleX;
-      double top = boundingBox.top * scaleY;
-      double right = boundingBox.right * scaleX;
-      double bottom = boundingBox.bottom * scaleY;
-
-      // Mirror horizontally for front camera
-      if (isFrontCamera) {
-        final mirroredLeft = canvasSize.width - right;
-        final mirroredRight = canvasSize.width - left;
-        left = mirroredLeft;
-        right = mirroredRight;
-      }
-
-      // Clamp to canvas bounds
-      left = left.clamp(0.0, canvasSize.width);
-      top = top.clamp(0.0, canvasSize.height);
-      right = right.clamp(0.0, canvasSize.width);
-      bottom = bottom.clamp(0.0, canvasSize.height);
-
-      final rect = Rect.fromLTRB(left, top, right, bottom);
-      final confidence = _getConfidence(object);
-      final isHighConfidence = confidence >= 0.7;
-
-      _drawDocumentOverlay(canvas, rect, isHighConfidence, confidence);
+      final rect = _translateRect(object.boundingBox, canvasSize);
+      final confidence = _maxConfidence(object);
+      _drawOverlay(canvas, rect, confidence >= 0.7, confidence);
     }
   }
 
-  double _getConfidence(DetectedObject object) {
-    if (object.labels.isEmpty) return 0.5;
-    return object.labels
-        .map((l) => l.confidence)
-        .reduce((a, b) => a > b ? a : b);
+  /// Translates a ML Kit bounding box to canvas coordinates.
+  Rect _translateRect(Rect bbox, Size canvasSize) {
+    // After rotation ML Kit's logical image dimensions may be swapped.
+    final double imageW;
+    final double imageH;
+
+    switch (rotation) {
+      case InputImageRotation.rotation90deg:
+      case InputImageRotation.rotation270deg:
+      // Sensor is landscape, device is portrait → swap
+        imageW = absoluteImageSize.height;
+        imageH = absoluteImageSize.width;
+        break;
+      default:
+        imageW = absoluteImageSize.width;
+        imageH = absoluteImageSize.height;
+    }
+
+    final double scaleX = canvasSize.width / imageW;
+    final double scaleY = canvasSize.height / imageH;
+
+    double left   = bbox.left   * scaleX;
+    double top    = bbox.top    * scaleY;
+    double right  = bbox.right  * scaleX;
+    double bottom = bbox.bottom * scaleY;
+
+    // Mirror horizontally for selfie camera
+    if (isFrontCamera) {
+      final l = canvasSize.width - right;
+      final r = canvasSize.width - left;
+      left  = l;
+      right = r;
+    }
+
+    return Rect.fromLTRB(
+      left.clamp(0, canvasSize.width),
+      top.clamp(0, canvasSize.height),
+      right.clamp(0, canvasSize.width),
+      bottom.clamp(0, canvasSize.height),
+    );
   }
 
-  void _drawDocumentOverlay(
-    Canvas canvas,
-    Rect rect,
-    bool isHighConfidence,
-    double confidence,
-  ) {
-    final color = isHighConfidence
-        ? const Color(0xFF00E676) // bright green for high confidence
-        : const Color(0xFFFFAB40); // amber for lower confidence
+  double _maxConfidence(DetectedObject object) {
+    if (object.labels.isEmpty) return 0.5;
+    return object.labels.map((l) => l.confidence).reduce((a, b) => a > b ? a : b);
+  }
 
-    // --- Semi-transparent fill ---
-    final fillPaint = Paint()
-      ..color = color.withOpacity(0.08)
-      ..style = PaintingStyle.fill;
-    canvas.drawRect(rect, fillPaint);
+  // ── Drawing helpers ───────────────────────────────────────────────────────
 
-    // --- Dashed border ---
+  void _drawOverlay(Canvas canvas, Rect rect, bool highConf, double conf) {
+    final color = highConf ? const Color(0xFF00E676) : const Color(0xFFFFAB40);
+
+    // Tinted fill
+    canvas.drawRect(rect, Paint()..color = color.withOpacity(0.10)..style = PaintingStyle.fill);
+
+    // Dashed border
     _drawDashedBorder(canvas, rect, color);
 
-    // --- Corner brackets ---
-    _drawCornerBrackets(canvas, rect, color);
+    // Corner brackets
+    _drawCorners(canvas, rect, color);
 
-    // --- Confidence badge ---
-    _drawConfidenceBadge(canvas, rect, confidence, color);
+    // Confidence label
+    _drawLabel(canvas, rect, conf, color);
   }
 
   void _drawDashedBorder(Canvas canvas, Rect rect, Color color) {
-    final borderPaint = Paint()
-      ..color = color.withOpacity(0.6)
+    final paint = Paint()
+      ..color = color.withOpacity(0.55)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.5;
 
-    const dashWidth = 8.0;
-    const dashSpace = 5.0;
-
     final path = Path();
-
-    // Top edge
-    _addDashedLine(
-      path,
-      Offset(rect.left, rect.top),
-      Offset(rect.right, rect.top),
-      dashWidth,
-      dashSpace,
-    );
-    // Bottom edge
-    _addDashedLine(
-      path,
-      Offset(rect.left, rect.bottom),
-      Offset(rect.right, rect.bottom),
-      dashWidth,
-      dashSpace,
-    );
-    // Left edge
-    _addDashedLine(
-      path,
-      Offset(rect.left, rect.top),
-      Offset(rect.left, rect.bottom),
-      dashWidth,
-      dashSpace,
-    );
-    // Right edge
-    _addDashedLine(
-      path,
-      Offset(rect.right, rect.top),
-      Offset(rect.right, rect.bottom),
-      dashWidth,
-      dashSpace,
-    );
-
-    canvas.drawPath(path, borderPaint);
+    _dash(path, rect.topLeft,     rect.topRight);
+    _dash(path, rect.bottomLeft,  rect.bottomRight);
+    _dash(path, rect.topLeft,     rect.bottomLeft);
+    _dash(path, rect.topRight,    rect.bottomRight);
+    canvas.drawPath(path, paint);
   }
 
-  void _addDashedLine(
-    Path path,
-    Offset start,
-    Offset end,
-    double dashWidth,
-    double dashSpace,
-  ) {
-    final dx = end.dx - start.dx;
-    final dy = end.dy - start.dy;
-    final length = (end - start).distance;
-    if (length == 0) return;
-
-    final unitX = dx / length;
-    final unitY = dy / length;
-
-    double distance = 0;
-    bool drawing = true;
-
-    while (distance < length) {
-      final segLength =
-          drawing ? dashWidth : dashSpace;
-      final segEnd = (distance + segLength).clamp(0.0, length);
-
-      if (drawing) {
-        path.moveTo(
-          start.dx + unitX * distance,
-          start.dy + unitY * distance,
-        );
-        path.lineTo(
-          start.dx + unitX * segEnd,
-          start.dy + unitY * segEnd,
-        );
+  void _dash(Path path, Offset a, Offset b, {double on = 8, double off = 5}) {
+    final dx = b.dx - a.dx;
+    final dy = b.dy - a.dy;
+    final len = (b - a).distance;
+    if (len == 0) return;
+    final ux = dx / len;
+    final uy = dy / len;
+    double d = 0;
+    bool draw = true;
+    while (d < len) {
+      final seg = (draw ? on : off).clamp(0, len - d);
+      if (draw) {
+        path.moveTo(a.dx + ux * d,       a.dy + uy * d);
+        path.lineTo(a.dx + ux * (d+seg), a.dy + uy * (d+seg));
       }
-
-      distance += segLength;
-      drawing = !drawing;
+      d += seg;
+      draw = !draw;
     }
   }
 
-  void _drawCornerBrackets(Canvas canvas, Rect rect, Color color) {
-    final bracketPaint = Paint()
+  void _drawCorners(Canvas canvas, Rect rect, Color color) {
+    final paint = Paint()
       ..color = color
       ..style = PaintingStyle.stroke
       ..strokeWidth = 3.0
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
 
-    final cornerSize = (rect.shortestSide * 0.15).clamp(12.0, 32.0);
+    final cs = (rect.shortestSide * 0.15).clamp(12.0, 30.0);
 
-    final corners = [
-      // Top-left
-      [
-        Offset(rect.left, rect.top + cornerSize),
-        Offset(rect.left, rect.top),
-        Offset(rect.left + cornerSize, rect.top),
-      ],
-      // Top-right
-      [
-        Offset(rect.right - cornerSize, rect.top),
-        Offset(rect.right, rect.top),
-        Offset(rect.right, rect.top + cornerSize),
-      ],
-      // Bottom-left
-      [
-        Offset(rect.left, rect.bottom - cornerSize),
-        Offset(rect.left, rect.bottom),
-        Offset(rect.left + cornerSize, rect.bottom),
-      ],
-      // Bottom-right
-      [
-        Offset(rect.right - cornerSize, rect.bottom),
-        Offset(rect.right, rect.bottom),
-        Offset(rect.right, rect.bottom - cornerSize),
-      ],
-    ];
-
-    for (final corner in corners) {
-      final path = Path()
-        ..moveTo(corner[0].dx, corner[0].dy)
-        ..lineTo(corner[1].dx, corner[1].dy)
-        ..lineTo(corner[2].dx, corner[2].dy);
-      canvas.drawPath(path, bracketPaint);
+    void corner(Offset a, Offset vertex, Offset b) {
+      canvas.drawPath(Path()..moveTo(a.dx, a.dy)..lineTo(vertex.dx, vertex.dy)..lineTo(b.dx, b.dy), paint);
     }
+
+    corner(Offset(rect.left,      rect.top + cs),    rect.topLeft,     Offset(rect.left + cs,  rect.top));
+    corner(Offset(rect.right - cs, rect.top),         rect.topRight,    Offset(rect.right,      rect.top + cs));
+    corner(Offset(rect.left,      rect.bottom - cs), rect.bottomLeft,  Offset(rect.left + cs,  rect.bottom));
+    corner(Offset(rect.right - cs, rect.bottom),      rect.bottomRight, Offset(rect.right,      rect.bottom - cs));
   }
 
-  void _drawConfidenceBadge(
-    Canvas canvas,
-    Rect rect,
-    double confidence,
-    Color color,
-  ) {
-    final label = '${(confidence * 100).toStringAsFixed(0)}%';
-    const fontSize = 11.0;
-
-    final textPainter = TextPainter(
+  void _drawLabel(Canvas canvas, Rect rect, double conf, Color color) {
+    final text = '${(conf * 100).toStringAsFixed(0)}%';
+    final tp = TextPainter(
       text: TextSpan(
-        text: label,
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: fontSize,
-          fontWeight: FontWeight.bold,
-          letterSpacing: 0.5,
-        ),
+        text: text,
+        style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
       ),
       textDirection: TextDirection.ltr,
     )..layout();
 
-    const padding = 5.0;
-    const badgeHeight = fontSize + padding * 2;
-    final badgeWidth = textPainter.width + padding * 2 + 8;
+    const px = 5.0;
+    const py = 4.0;
+    final bw = tp.width + px * 2;
+    const bh = 11.0 + py * 2;
+    final bx = rect.left;
+    final by = (rect.top - bh - 3) < 0 ? rect.top + 3 : rect.top - bh - 3;
 
-    final badgeLeft = rect.left;
-    final badgeTop = rect.top - badgeHeight - 4;
-
-    // Keep badge within canvas bounds
-    final safeTop = badgeTop < 0 ? rect.top + 4 : badgeTop;
-
-    final badgeRect = RRect.fromRectAndRadius(
-      Rect.fromLTWH(badgeLeft, safeTop, badgeWidth, badgeHeight),
-      const Radius.circular(4),
-    );
-
-    // Badge background
     canvas.drawRRect(
-      badgeRect,
-      Paint()..color = color.withOpacity(0.9),
+      RRect.fromRectAndRadius(Rect.fromLTWH(bx, by, bw, bh), const Radius.circular(4)),
+      Paint()..color = color.withOpacity(0.88),
     );
-
-    // Badge text
-    textPainter.paint(
-      canvas,
-      Offset(badgeLeft + padding + 4, safeTop + padding),
-    );
+    tp.paint(canvas, Offset(bx + px, by + py));
   }
 
   @override
-  bool shouldRepaint(DocumentOverlayPainter oldDelegate) {
-    return oldDelegate.detectedObjects != detectedObjects ||
-        oldDelegate.imageSize != imageSize;
-  }
+  bool shouldRepaint(DocumentOverlayPainter old) =>
+      old.detectedObjects != detectedObjects ||
+          old.absoluteImageSize != absoluteImageSize ||
+          old.rotation != rotation;
 }

@@ -1,3 +1,4 @@
+import 'package:flutter/cupertino.dart';
 import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
 
 class ObjectDetectorService {
@@ -28,15 +29,24 @@ class ObjectDetectorService {
   /// Process a single frame and return detected objects.
   /// Returns null if already processing a frame (to avoid backpressure).
   Future<List<DetectedObject>?> processImage(InputImage inputImage) async {
-    if (!_isInitialized || _objectDetector == null) return null;
-    if (_isBusy) return null;
+    if (!_isInitialized || _objectDetector == null) {
+      debugPrint("ProcessImage: Detector not initialized.");
+      return null;
+    }
+    if (_isBusy) {
+      debugPrint("ProcessImage: Detector busy, skipping frame.");
+      return null;
+    }
 
     _isBusy = true;
+    debugPrint("ProcessImage: Starting inference...");
+
     try {
       final objects = await _objectDetector!.processImage(inputImage);
+      debugPrint("ProcessImage: Success! Found ${objects.length} objects.");
       return objects;
     } catch (e) {
-      // Silently ignore frame processing errors (e.g. rotation mismatch)
+      debugPrint("ProcessImage: Error processing frame: $e");
       return null;
     } finally {
       _isBusy = false;

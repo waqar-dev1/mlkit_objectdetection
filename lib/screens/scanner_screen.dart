@@ -266,21 +266,51 @@ class _ScannerScreenState extends State<ScannerScreen>
   Widget _buildCameraView() {
     final controller = _cameraController!;
 
+    // controller.value.aspectRatio is the RAW sensor ratio (landscape, e.g. 1.77).
+    // The camera plugin rotates the preview to match device orientation, so on a
+    // portrait device the effective display ratio is the INVERSE (e.g. 0.56).
+    // We must use the inverted value so our overlay SizedBox matches what is
+    // actually rendered on screen.
+    final rawRatio    = controller.value.aspectRatio; // sensor: w/h (>1 on most phones)
+    final screenSize  = MediaQuery.of(context).size;
+    final isPortrait  = screenSize.height > screenSize.width;
+
+    // Effective preview ratio as it appears on screen
+    final previewRatio = isPortrait ? (1.0 / rawRatio) : rawRatio;
+    final screenRatio  = screenSize.width / screenSize.height;
+
+    double previewW, previewH;
+    if (screenRatio > previewRatio) {
+      // Screen is wider than preview → preview fills height, pillarboxed
+      previewH = screenSize.height;
+      previewW = previewH * previewRatio;
+    } else {
+      // Screen is taller than preview → preview fills width, letterboxed
+      previewW = screenSize.width;
+      previewH = previewW / previewRatio;
+    }
+
     return Stack(
       fit: StackFit.expand,
       children: [
         // ── Camera preview ──
         CameraPreview(controller),
 
-        // ── Detection overlay ──
+        // ── Detection overlay — sized & centred to match the preview rect ──
         if (_detectedObjects.isNotEmpty && _imageSize != null)
-          CustomPaint(
-            painter: DocumentOverlayPainter(
-              detectedObjects: _detectedObjects,
-              absoluteImageSize: _imageSize!,
-              rotation: _rotation,
-              isFrontCamera: _cameras![_selectedCameraIndex].lensDirection ==
-                  CameraLensDirection.front,
+          Center(
+            child: SizedBox(
+              width:  previewW,
+              height: previewH,
+              child: CustomPaint(
+                painter: DocumentOverlayPainter(
+                  detectedObjects: _detectedObjects,
+                  absoluteImageSize: _imageSize!,
+                  rotation: _rotation,
+                  isFrontCamera: _cameras![_selectedCameraIndex].lensDirection ==
+                      CameraLensDirection.front,
+                ),
+              ),
             ),
           ),
 

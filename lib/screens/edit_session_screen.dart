@@ -3,11 +3,11 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:ml_objecdetection/screens/providers/capture_session.dart';
-
 import '../utils/edge_detection_service.dart';
 import '../utils/image_processor.dart';
 import '../widgets/crop/crop_editor.dart';
 import '../widgets/filter/filter_strip.dart';
+
 /// Phase 3 — Edit screen.
 ///
 /// Layout:
@@ -173,7 +173,46 @@ class _EditSessionScreenState extends State<EditSessionScreen> {
     ));
   }
 
-  // ── Process & done ─────────────────────────────────────────────────────────
+  // ── Delete page ───────────────────────────────────────────────────────────────
+
+  Future<void> _deletePage(int index) async {
+    if (_session.count == 1) {
+      // Last page — confirm before deleting (would leave session empty)
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (_) => AlertDialog(
+          backgroundColor: const Color(0xFF1E1E1E),
+          title: const Text('Delete last page?',
+              style: TextStyle(color: Colors.white)),
+          content: const Text(
+              'This is the only page. Deleting it will close the editor.',
+              style: TextStyle(color: Colors.white70)),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel',
+                    style: TextStyle(color: Colors.white54))),
+            TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Delete',
+                    style: TextStyle(color: Colors.redAccent))),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+      _session.removePage(_session.pages[index].id);
+      if (mounted) Navigator.of(context).maybePop();
+      return;
+    }
+
+    _session.removePage(_session.pages[index].id);
+
+    // Adjust active index so we don't go out of bounds
+    final newIndex = index >= _session.count ? _session.count - 1 : index;
+    await _loadPage(newIndex);
+  }
+
+  // ── Process & done ─────────────────────────────────────────────────────────────
 
   Future<void> _onDone() async {
     // Process every page that hasn't been processed yet (or has been changed).
@@ -378,6 +417,7 @@ class _EditSessionScreenState extends State<EditSessionScreen> {
 
           return GestureDetector(
             onTap: () => _loadPage(i),
+            onLongPress: () => _deletePage(i),
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 150),
               width: 52,
@@ -401,10 +441,10 @@ class _EditSessionScreenState extends State<EditSessionScreen> {
                       fit: BoxFit.cover,
                     ),
                   ),
-                  // Page number badge
+                  // Page number badge (bottom-left)
                   Positioned(
                     bottom: 2,
-                    right: 2,
+                    left: 3,
                     child: Container(
                       padding: const EdgeInsets.symmetric(
                           horizontal: 4, vertical: 1),
@@ -416,6 +456,24 @@ class _EditSessionScreenState extends State<EditSessionScreen> {
                         '${i + 1}',
                         style: const TextStyle(
                             color: Colors.white, fontSize: 9),
+                      ),
+                    ),
+                  ),
+                  // Delete icon (top-right) — always visible, small
+                  Positioned(
+                    top: 2,
+                    right: 2,
+                    child: GestureDetector(
+                      onTap: () => _deletePage(i),
+                      child: Container(
+                        width: 18,
+                        height: 18,
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.65),
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Icon(Icons.close,
+                            color: Colors.white, size: 11),
                       ),
                     ),
                   ),

@@ -3,20 +3,22 @@ import 'package:flutter/material.dart';
 
 import '../../screens/providers/capture_session.dart';
 
-/// Interactive 4-corner document crop editor.
-///
-/// Renders over an image (inside a [Stack]) and lets the user drag each
-/// corner handle to adjust the crop quad.  The parent receives updates via
-/// [onQuadChanged].
-///
-/// Coordinate system: all values are normalised [0..1] relative to the
-/// widget's own size, so the widget can be any size without the caller
-/// needing to know the image dimensions.
-class CropEditor extends StatefulWidget {
-  /// Initial quad in normalised [0..1] coordinates.
-  final CropQuad normQuad;
+/// Handle types tracked during a drag gesture.
+enum _HandleType {
+  cornerTL, cornerTR, cornerBR, cornerBL,   // drag individual corner
+  edgeTop, edgeRight, edgeBottom, edgeLeft,  // drag entire edge inward/outward
+  none,
+}
 
-  /// Called continuously while the user drags a corner.
+/// Interactive 4-corner + 4-edge-midpoint crop editor.
+///
+/// Corner handles  → move that corner freely (free-form quad distortion)
+/// Edge handles    → move the entire edge inward or outward, keeping the
+///                   opposite edge fixed (like Adobe Scan edge nudge)
+///
+/// All coordinates are normalised [0..1] relative to the widget size.
+class CropEditor extends StatefulWidget {
+  final CropQuad normQuad;
   final ValueChanged<CropQuad> onQuadChanged;
 
   const CropEditor({
@@ -31,13 +33,11 @@ class CropEditor extends StatefulWidget {
 
 class _CropEditorState extends State<CropEditor> {
   late CropQuad _quad;
+  _HandleType _dragging = _HandleType.none;
 
-  // Which corner is being dragged, or -1 for none.
-  // 0=topLeft, 1=topRight, 2=bottomRight, 3=bottomLeft
-  int _dragging = -1;
-
-  static const double _handleRadius = 14.0;
-  static const double _hitRadius    = 28.0; // larger invisible hit area
+  // Slightly larger invisible hit areas for comfortable touch
+  static const double _cornerHit = 32.0;
+  static const double _edgeHit   = 28.0;
 
   @override
   void initState() {
@@ -48,49 +48,117 @@ class _CropEditorState extends State<CropEditor> {
   @override
   void didUpdateWidget(CropEditor old) {
     super.didUpdateWidget(old);
-    if (old.normQuad != widget.normQuad) _quad = widget.normQuad;
-  }
-
-  List<Offset> get _corners => _quad.corners; // TL TR BR BL
-
-  Offset _cornerAt(int i, Size size) {
-    final c = _corners[i];
-    return Offset(c.dx * size.width, c.dy * size.height);
-  }
-
-  CropQuad _updateCorner(int i, Offset normPos) {
-    final clamped = Offset(
-      normPos.dx.clamp(0.0, 1.0),
-      normPos.dy.clamp(0.0, 1.0),
-    );
-    return CropQuad(
-      topLeft:     i == 0 ? clamped : _quad.topLeft,
-      topRight:    i == 1 ? clamped : _quad.topRight,
-      bottomRight: i == 2 ? clamped : _quad.bottomRight,
-      bottomLeft:  i == 3 ? clamped : _quad.bottomLeft,
-    );
-  }
-
-  void _onPanStart(DragStartDetails d, Size size) {
-    for (int i = 0; i < 4; i++) {
-      if ((_cornerAt(i, size) - d.localPosition).distance < _hitRadius) {
-        setState(() => _dragging = i);
-        return;
-      }
+    if (old.normQuad != widget.normQuad && _dragging == _HandleType.none) {
+      _quad = widget.normQuad;
     }
   }
 
-  void _onPanUpdate(DragUpdateDetails d, Size size) {
-    if (_dragging < 0) return;
-    final norm = Offset(
-      d.localPosition.dx / size.width,
-      d.localPosition.dy / size.height,
-    );
-    setState(() => _quad = _updateCorner(_dragging, norm));
-    widget.onQuadChanged(_quad);
+  // ── Handle positions ──────────────────────────────────────────────────────
+
+  Offset _px(Offset norm, Size size) =>
+      Offset(norm.dx * size.width, norm.dy * size.height);
+
+  /// Midpoint of the top edge (TL → TR)
+  Offset _midTop(Size s) =>
+      _px(Offset.lerp(_quad.topLeft, _quad.topRight, 0.5)!, s);
+
+  /// Midpoint of the bottom edge (BL → BR)
+  Offset _midBottom(Size s) =>
+      _px(Offset.lerp(_quad.bottomLeft, _quad.bottomRight, 0.5)!, s);
+
+  /// Midpoint of the left edge (TL → BL)
+  Offset _midLeft(Size s) =>
+      _px(Offset.lerp(_quad.topLeft, _quad.bottomLeft, 0.5)!, s);
+
+  /// Midpoint of the right edge (TR → BR)
+  Offset _midRight(Size s) =>
+      _px(Offset.lerp(_quad.topRight, _quad.bottomRight, 0.5)!, s);
+
+  // ── Hit testing ───────────────────────────────────────────────────────────
+
+  _HandleType _hitTest(Offset pos, Size size) {
+    Offset c(Offset n) => _px(n, size);
+
+    // Corners first (higher priority)
+    if ((c(_quad.topLeft)     - pos).distance < _cornerHit) return _HandleType.cornerTL;
+    if ((c(_quad.topRight)    - pos).distance < _cornerHit) return _HandleType.cornerTR;
+    if ((c(_quad.bottomRight) - pos).distance < _cornerHit) return _HandleType.cornerBR;
+    if ((c(_quad.bottomLeft)  - pos).distance < _cornerHit) return _HandleType.cornerBL;
+
+    // Edge midpoints
+    if ((_midTop(size)    - pos).distance < _edgeHit) return _HandleType.edgeTop;
+    if ((_midBottom(size) - pos).distance < _edgeHit) return _HandleType.edgeBottom;
+    if ((_midLeft(size)   - pos).distance < _edgeHit) return _HandleType.edgeLeft;
+    if ((_midRight(size)  - pos).distance < _edgeHit) return _HandleType.edgeRight;
+
+    return _HandleType.none;
   }
 
-  void _onPanEnd(DragEndDetails _) => setState(() => _dragging = -1);
+  // ── Drag callbacks ────────────────────────────────────────────────────────
+
+  void _onPanStart(DragStartDetails d, Size size) {
+    setState(() => _dragging = _hitTest(d.localPosition, size));
+  }
+
+  void _onPanUpdate(DragUpdateDetails d, Size size) {
+    if (_dragging == _HandleType.none) return;
+
+    final nx = (d.localPosition.dx / size.width).clamp(0.0, 1.0);
+    final ny = (d.localPosition.dy / size.height).clamp(0.0, 1.0);
+    final norm = Offset(nx, ny);
+
+    CropQuad next;
+
+    switch (_dragging) {
+    // ── Corner drags (free) ───────────────────────────────────────────────
+      case _HandleType.cornerTL:
+        next = _quad.copyWith(topLeft: norm);
+      case _HandleType.cornerTR:
+        next = _quad.copyWith(topRight: norm);
+      case _HandleType.cornerBR:
+        next = _quad.copyWith(bottomRight: norm);
+      case _HandleType.cornerBL:
+        next = _quad.copyWith(bottomLeft: norm);
+
+    // ── Edge drags (move both corners of that edge by delta) ──────────────
+      case _HandleType.edgeTop:
+      // Only Y delta — keeps horizontal positions, shifts both top corners
+        final dy = d.delta.dy / size.height;
+        next = _quad.copyWith(
+          topLeft:  Offset(_quad.topLeft.dx,  (_quad.topLeft.dy  + dy).clamp(0,1)),
+          topRight: Offset(_quad.topRight.dx, (_quad.topRight.dy + dy).clamp(0,1)),
+        );
+      case _HandleType.edgeBottom:
+        final dy = d.delta.dy / size.height;
+        next = _quad.copyWith(
+          bottomLeft:  Offset(_quad.bottomLeft.dx,  (_quad.bottomLeft.dy  + dy).clamp(0,1)),
+          bottomRight: Offset(_quad.bottomRight.dx, (_quad.bottomRight.dy + dy).clamp(0,1)),
+        );
+      case _HandleType.edgeLeft:
+        final dx = d.delta.dx / size.width;
+        next = _quad.copyWith(
+          topLeft:    Offset((_quad.topLeft.dx   + dx).clamp(0,1), _quad.topLeft.dy),
+          bottomLeft: Offset((_quad.bottomLeft.dx + dx).clamp(0,1), _quad.bottomLeft.dy),
+        );
+      case _HandleType.edgeRight:
+        final dx = d.delta.dx / size.width;
+        next = _quad.copyWith(
+          topRight:    Offset((_quad.topRight.dx   + dx).clamp(0,1), _quad.topRight.dy),
+          bottomRight: Offset((_quad.bottomRight.dx + dx).clamp(0,1), _quad.bottomRight.dy),
+        );
+
+      default:
+        return;
+    }
+
+    setState(() => _quad = next);
+    widget.onQuadChanged(next);
+  }
+
+  void _onPanEnd(DragEndDetails _) =>
+      setState(() => _dragging = _HandleType.none);
+
+  // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -101,10 +169,7 @@ class _CropEditorState extends State<CropEditor> {
         onPanUpdate: (d) => _onPanUpdate(d, size),
         onPanEnd:    _onPanEnd,
         child: CustomPaint(
-          painter: _CropPainter(
-            quad:     _quad,
-            dragging: _dragging,
-          ),
+          painter: _CropPainter(quad: _quad, dragging: _dragging),
           size: size,
         ),
       );
@@ -112,80 +177,176 @@ class _CropEditorState extends State<CropEditor> {
   }
 }
 
-// ── Painter ────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Painter
+// ─────────────────────────────────────────────────────────────────────────────
 
 class _CropPainter extends CustomPainter {
   final CropQuad quad;
-  final int dragging;
+  final _HandleType dragging;
+
+  static const _green  = Color(0xFF00E676);
+  static const _white  = Colors.white;
 
   const _CropPainter({required this.quad, required this.dragging});
 
-  static const _handleRadius = 14.0;
-  static const _accentColor  = Color(0xFF00E676);
+  // Corner L-bracket arm length
+  static const _arm = 22.0;
+  // Corner stroke width
+  static const _cornerSW = 3.5;
+  // Edge handle radius
+  static const _edgeR = 9.0;
+  // Border stroke
+  static const _borderSW = 1.5;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final corners = quad.corners.map((c) =>
-        Offset(c.dx * size.width, c.dy * size.height)).toList();
+    final c = quad.corners
+        .map((n) => Offset(n.dx * size.width, n.dy * size.height))
+        .toList();
+    // c[0]=TL  c[1]=TR  c[2]=BR  c[3]=BL
 
-    // ── Dim mask outside the quad ──────────────────────────────────────────
-    final quadPath = Path()..addPolygon(corners, true);
-    final fullPath = Path()
-      ..addRect(Rect.fromLTWH(0, 0, size.width, size.height));
-    final maskPath = Path.combine(PathOperation.difference, fullPath, quadPath);
-    canvas.drawPath(maskPath,
-        Paint()..color = Colors.black.withOpacity(0.45));
+    // ── Dim mask outside quad ─────────────────────────────────────────────
+    final qPath = Path()..addPolygon(c, true);
+    canvas.drawPath(
+      Path.combine(PathOperation.difference,
+          Path()..addRect(Offset.zero & size), qPath),
+      Paint()..color = Colors.black.withOpacity(0.50),
+    );
 
-    // ── Quad border ────────────────────────────────────────────────────────
-    final borderPaint = Paint()
-      ..color       = _accentColor
-      ..style       = PaintingStyle.stroke
-      ..strokeWidth = 1.8;
-    canvas.drawPath(quadPath, borderPaint);
-
-    // ── Grid lines (3×3 rule-of-thirds) ───────────────────────────────────
-    _drawGrid(canvas, corners);
-
-    // ── Corner handles ─────────────────────────────────────────────────────
-    for (int i = 0; i < 4; i++) {
-      final isActive = dragging == i;
-      // Outer ring
-      canvas.drawCircle(
-        corners[i],
-        _handleRadius,
+    // ── Quad border (thin, slightly transparent) ──────────────────────────
+    canvas.drawPath(
+        qPath,
         Paint()
-          ..color       = _accentColor.withOpacity(isActive ? 1.0 : 0.85)
-          ..style       = PaintingStyle.stroke
-          ..strokeWidth = 2.5,
-      );
-      // Filled dot
-      canvas.drawCircle(
-        corners[i],
-        isActive ? 8.0 : 5.0,
-        Paint()..color = _accentColor,
-      );
+          ..color = _green.withOpacity(0.55)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = _borderSW);
+
+    // ── Rule-of-thirds grid ───────────────────────────────────────────────
+    _drawGrid(canvas, c);
+
+    // ── Corner L-brackets ─────────────────────────────────────────────────
+    _drawCornerBracket(canvas, c[0], c[1], c[3], dragging == _HandleType.cornerTL); // TL
+    _drawCornerBracket(canvas, c[1], c[0], c[2], dragging == _HandleType.cornerTR); // TR
+    _drawCornerBracket(canvas, c[2], c[3], c[1], dragging == _HandleType.cornerBR); // BR
+    _drawCornerBracket(canvas, c[3], c[2], c[0], dragging == _HandleType.cornerBL); // BL
+
+    // ── Edge midpoint handles ─────────────────────────────────────────────
+    final midTop    = _lerp(c[0], c[1], 0.5);
+    final midBottom = _lerp(c[3], c[2], 0.5);
+    final midLeft   = _lerp(c[0], c[3], 0.5);
+    final midRight  = _lerp(c[1], c[2], 0.5);
+
+    _drawEdgeHandle(canvas, midTop,    dragging == _HandleType.edgeTop,    vertical: true);
+    _drawEdgeHandle(canvas, midBottom, dragging == _HandleType.edgeBottom,  vertical: true);
+    _drawEdgeHandle(canvas, midLeft,   dragging == _HandleType.edgeLeft,   vertical: false);
+    _drawEdgeHandle(canvas, midRight,  dragging == _HandleType.edgeRight,  vertical: false);
+  }
+
+  // ── Corner bracket ────────────────────────────────────────────────────────
+  //
+  // Draws an L-shaped bracket at [corner], with arms pointing toward
+  // [adjH] (horizontal neighbour) and [adjV] (vertical neighbour).
+  void _drawCornerBracket(
+      Canvas canvas, Offset corner, Offset adjH, Offset adjV, bool active) {
+    final color = active ? _white : _green;
+    final paint = Paint()
+      ..color       = color
+      ..style       = PaintingStyle.stroke
+      ..strokeWidth = _cornerSW
+      ..strokeCap   = StrokeCap.round
+      ..strokeJoin  = StrokeJoin.round;
+
+    // Unit vectors toward each adjacent corner
+    Offset unit(Offset from, Offset to) {
+      final d = to - from;
+      final len = d.distance;
+      return len == 0 ? Offset.zero : d / len;
+    }
+
+    final toH = unit(corner, adjH) * _arm;
+    final toV = unit(corner, adjV) * _arm;
+
+    final path = Path()
+      ..moveTo(corner.dx + toH.dx, corner.dy + toH.dy)
+      ..lineTo(corner.dx,          corner.dy)
+      ..lineTo(corner.dx + toV.dx, corner.dy + toV.dy);
+
+    canvas.drawPath(path, paint);
+
+    // Small filled dot at the corner centre
+    canvas.drawCircle(corner, active ? 5.0 : 3.5,
+        Paint()..color = color);
+  }
+
+  // ── Edge midpoint handle ──────────────────────────────────────────────────
+  //
+  // A small pill/bar shape aligned along the edge direction.
+  void _drawEdgeHandle(Canvas canvas, Offset mid, bool active,
+      {required bool vertical}) {
+    final color  = active ? _white : _green.withOpacity(0.85);
+    final radius = active ? _edgeR + 2.0 : _edgeR;
+
+    // Pill background
+    canvas.drawCircle(mid, radius,
+        Paint()..color = Colors.black.withOpacity(0.35));
+
+    // Border ring
+    canvas.drawCircle(mid, radius,
+        Paint()
+          ..color = color
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.0);
+
+    // Directional arrows (two small chevrons)
+    final arrowPaint = Paint()
+      ..color       = color
+      ..style       = PaintingStyle.stroke
+      ..strokeWidth = 1.8
+      ..strokeCap   = StrokeCap.round;
+
+    const aw = 4.0; // arrow half-width
+    const ah = 3.5; // arrow depth
+
+    if (vertical) {
+      // Up arrow
+      canvas.drawLine(Offset(mid.dx - aw, mid.dy - 2),
+          Offset(mid.dx,       mid.dy - 2 - ah), arrowPaint);
+      canvas.drawLine(Offset(mid.dx + aw, mid.dy - 2),
+          Offset(mid.dx,       mid.dy - 2 - ah), arrowPaint);
+      // Down arrow
+      canvas.drawLine(Offset(mid.dx - aw, mid.dy + 2),
+          Offset(mid.dx,       mid.dy + 2 + ah), arrowPaint);
+      canvas.drawLine(Offset(mid.dx + aw, mid.dy + 2),
+          Offset(mid.dx,       mid.dy + 2 + ah), arrowPaint);
+    } else {
+      // Left arrow
+      canvas.drawLine(Offset(mid.dx - 2, mid.dy - aw),
+          Offset(mid.dx - 2 - ah, mid.dy), arrowPaint);
+      canvas.drawLine(Offset(mid.dx - 2, mid.dy + aw),
+          Offset(mid.dx - 2 - ah, mid.dy), arrowPaint);
+      // Right arrow
+      canvas.drawLine(Offset(mid.dx + 2, mid.dy - aw),
+          Offset(mid.dx + 2 + ah, mid.dy), arrowPaint);
+      canvas.drawLine(Offset(mid.dx + 2, mid.dy + aw),
+          Offset(mid.dx + 2 + ah, mid.dy), arrowPaint);
     }
   }
+
+  // ── Grid ──────────────────────────────────────────────────────────────────
 
   void _drawGrid(Canvas canvas, List<Offset> c) {
-    final gridPaint = Paint()
-      ..color       = Colors.white.withOpacity(0.25)
-      ..strokeWidth = 0.75;
-
-    // Interpolate inside the quad for a perspective-correct grid
-    for (int row = 1; row <= 2; row++) {
-      final t = row / 3.0;
-      final left  = Offset.lerp(c[0], c[3], t)!;
-      final right = Offset.lerp(c[1], c[2], t)!;
-      canvas.drawLine(left, right, gridPaint);
-    }
-    for (int col = 1; col <= 2; col++) {
-      final t = col / 3.0;
-      final top    = Offset.lerp(c[0], c[1], t)!;
-      final bottom = Offset.lerp(c[3], c[2], t)!;
-      canvas.drawLine(top, bottom, gridPaint);
+    final p = Paint()
+      ..color       = _white.withOpacity(0.18)
+      ..strokeWidth = 0.8;
+    for (int i = 1; i <= 2; i++) {
+      final t = i / 3.0;
+      canvas.drawLine(_lerp(c[0], c[1], t), _lerp(c[3], c[2], t), p);
+      canvas.drawLine(_lerp(c[0], c[3], t), _lerp(c[1], c[2], t), p);
     }
   }
+
+  Offset _lerp(Offset a, Offset b, double t) => Offset.lerp(a, b, t)!;
 
   @override
   bool shouldRepaint(_CropPainter old) =>

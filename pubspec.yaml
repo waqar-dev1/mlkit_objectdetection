@@ -36,6 +36,9 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
+  # Phase 3 — image processing
+  image: ^4.1.7               # pure-Dart pixel manipulation (crop, grayscale, contrast, etc.)
+  path_provider: ^2.1.2       # write processed files to app temp dir
 
 dev_dependencies:
   flutter_test:

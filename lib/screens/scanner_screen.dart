@@ -3,11 +3,13 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
+import 'package:ml_objecdetection/screens/providers/capture_session.dart';
 import 'package:permission_handler/permission_handler.dart';
-
 import '../painters/document_overlay_painter.dart';
 import '../utils/camera_utils.dart';
 import '../utils/object_detector_service.dart';
+import '../widgets/capture_button.dart';
+import 'edit_session_screen.dart';
 
 class ScannerScreen extends StatefulWidget {
   const ScannerScreen({super.key});
@@ -18,22 +20,27 @@ class ScannerScreen extends StatefulWidget {
 
 class _ScannerScreenState extends State<ScannerScreen>
     with WidgetsBindingObserver {
-  // Camera
-  List<CameraDescription>? _cameras;
+  // ── Camera (back only) ──────────────────────────────────────────────────
+  CameraDescription? _backCamera;
   CameraController? _cameraController;
-  int _selectedCameraIndex = 0;
   bool _isCameraInitialized = false;
 
-  // Detection
+  // ── Detection ────────────────────────────────────────────────────────────
   final ObjectDetectorService _detectorService = ObjectDetectorService();
   List<DetectedObject> _detectedObjects = [];
   Size? _imageSize;
   InputImageRotation _rotation = InputImageRotation.rotation0deg;
 
-  // State
+  // ── Capture session ──────────────────────────────────────────────────────
+  final CaptureSession _session = CaptureSession();
+  bool _isCapturing = false;
+
+  // ── UI state ─────────────────────────────────────────────────────────────
   bool _hasPermission = false;
   String? _errorMessage;
   bool _isFlashOn = false;
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   @override
   void initState() {
@@ -46,19 +53,29 @@ class _ScannerScreenState extends State<ScannerScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final controller = _cameraController;
     if (controller == null || !controller.value.isInitialized) return;
-
     if (state == AppLifecycleState.inactive) {
       _stopCamera();
     } else if (state == AppLifecycleState.resumed) {
-      _startCamera(_selectedCameraIndex);
+      _startCamera();
     }
   }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _stopCamera();
+    _detectorService.dispose();
+    _session.dispose();
+    super.dispose();
+  }
+
+  // ── Initialisation ────────────────────────────────────────────────────────
 
   Future<void> _initializeApp() async {
     await _requestPermissions();
     if (_hasPermission) {
       await _detectorService.initialize();
-      await _loadCameras();
+      await _loadCamera();
     }
   }
 
@@ -74,23 +91,22 @@ class _ScannerScreenState extends State<ScannerScreen>
     });
   }
 
-  Future<void> _loadCameras() async {
+  Future<void> _loadCamera() async {
     try {
-      _cameras = await availableCameras();
-      if (_cameras != null && _cameras!.isNotEmpty) {
-        await _startCamera(0);
-      } else {
-        setState(() => _errorMessage = 'No cameras found on this device.');
-      }
+      final cameras = await availableCameras();
+      _backCamera = cameras.firstWhere(
+            (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+      await _startCamera();
     } on CameraException catch (e) {
-      setState(() => _errorMessage = 'Failed to load cameras: ${e.description}');
+      setState(() => _errorMessage = 'Failed to load camera: ${e.description}');
     }
   }
 
-  Future<void> _startCamera(int cameraIndex) async {
-    if (_cameras == null || _cameras!.isEmpty) return;
-
-    final camera = _cameras![cameraIndex];
+  Future<void> _startCamera() async {
+    final camera = _backCamera;
+    if (camera == null) return;
 
     final controller = CameraController(
       camera,
@@ -100,60 +116,46 @@ class _ScannerScreenState extends State<ScannerScreen>
           ? ImageFormatGroup.yuv420
           : ImageFormatGroup.bgra8888,
     );
-
     _cameraController = controller;
 
     try {
       await controller.initialize();
       if (!mounted) return;
-
-      // Reset flash
       _isFlashOn = false;
-
       setState(() {
-        _selectedCameraIndex = cameraIndex;
         _isCameraInitialized = true;
         _errorMessage = null;
         _detectedObjects = [];
       });
-
-      // Start processing frames
       await controller.startImageStream(_processFrame);
     } on CameraException catch (e) {
-      if (mounted) {
-        setState(() => _errorMessage = 'Camera error: ${e.description}');
-      }
+      if (mounted) setState(() => _errorMessage = 'Camera error: ${e.description}');
     }
   }
 
   Future<void> _stopCamera() async {
     final controller = _cameraController;
     if (controller == null) return;
-
-    if (controller.value.isStreamingImages) {
-      await controller.stopImageStream();
-    }
+    if (controller.value.isStreamingImages) await controller.stopImageStream();
     await controller.dispose();
     _cameraController = null;
-
-    if (mounted) {
-      setState(() => _isCameraInitialized = false);
-    }
+    if (mounted) setState(() => _isCameraInitialized = false);
   }
+
+  // ── Frame processing ──────────────────────────────────────────────────────
 
   void _processFrame(CameraImage image) {
     if (!mounted) return;
+    final camera = _backCamera;
+    if (camera == null) return;
 
-    final camera = _cameras![_selectedCameraIndex];
     final inputImage = CameraUtils.cameraImageToInputImage(image, camera);
     if (inputImage == null) return;
 
-    // Capture the rotation used so the painter can correct coordinates.
     final rotation = CameraUtils.rotationForCamera(camera);
 
     _detectorService.processImage(inputImage).then((objects) {
       if (!mounted || objects == null) return;
-
       setState(() {
         _detectedObjects = objects;
         _imageSize = Size(image.width.toDouble(), image.height.toDouble());
@@ -162,32 +164,59 @@ class _ScannerScreenState extends State<ScannerScreen>
     });
   }
 
+  // ── Capture ───────────────────────────────────────────────────────────────
+
+  Future<void> _captureImage() async {
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) return;
+    if (_isCapturing) return;
+
+    setState(() => _isCapturing = true);
+
+    try {
+      // Stop ML stream to free resources during capture
+      if (controller.value.isStreamingImages) {
+        await controller.stopImageStream();
+      }
+
+      final xfile = await controller.takePicture();
+      final doc = CapturedDocument.fromXFile(xfile);
+      _session.addPage(doc);
+      setState(() {}); // rebuild tray
+
+      // Resume detection
+      await controller.startImageStream(_processFrame);
+    } on CameraException catch (e) {
+      debugPrint('Capture error: ${e.description}');
+    } finally {
+      if (mounted) setState(() => _isCapturing = false);
+    }
+  }
+
+  // ── Flash ─────────────────────────────────────────────────────────────────
+
   Future<void> _toggleFlash() async {
     final controller = _cameraController;
     if (controller == null || !controller.value.isInitialized) return;
-
     setState(() => _isFlashOn = !_isFlashOn);
     await controller.setFlashMode(
       _isFlashOn ? FlashMode.torch : FlashMode.off,
     );
   }
 
-  Future<void> _switchCamera() async {
-    if (_cameras == null || _cameras!.length < 2) return;
-    await _stopCamera();
-    final nextIndex = (_selectedCameraIndex + 1) % _cameras!.length;
-    await _startCamera(nextIndex);
+  // ── Navigation ────────────────────────────────────────────────────────────
+
+  void _goBack() => Navigator.of(context).maybePop();
+
+  void _onComplete() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => EditSessionScreen(session: _session),
+      ),
+    );
   }
 
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _stopCamera();
-    _detectorService.dispose();
-    super.dispose();
-  }
-
-  // ─────────────────────────── UI ───────────────────────────
+  // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -201,14 +230,8 @@ class _ScannerScreenState extends State<ScannerScreen>
   }
 
   Widget _buildBody() {
-    if (_errorMessage != null) {
-      return _buildErrorView();
-    }
-
-    if (!_isCameraInitialized || _cameraController == null) {
-      return _buildLoadingView();
-    }
-
+    if (_errorMessage != null) return _buildErrorView();
+    if (!_isCameraInitialized || _cameraController == null) return _buildLoadingView();
     return _buildCameraView();
   }
 
@@ -219,10 +242,8 @@ class _ScannerScreenState extends State<ScannerScreen>
         children: [
           CircularProgressIndicator(color: Color(0xFF00E676)),
           SizedBox(height: 16),
-          Text(
-            'Starting camera…',
-            style: TextStyle(color: Colors.white70, fontSize: 14),
-          ),
+          Text('Starting camera…',
+              style: TextStyle(color: Colors.white70, fontSize: 14)),
         ],
       ),
     );
@@ -235,13 +256,12 @@ class _ScannerScreenState extends State<ScannerScreen>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.camera_alt_outlined, color: Colors.white38, size: 64),
+            const Icon(Icons.camera_alt_outlined, color: Colors.white38, size: 64),
             const SizedBox(height: 20),
-            Text(
-              _errorMessage!,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white70, fontSize: 15, height: 1.5),
-            ),
+            Text(_errorMessage!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                    color: Colors.white70, fontSize: 15, height: 1.5)),
             const SizedBox(height: 24),
             if (_errorMessage!.contains('Settings'))
               TextButton.icon(
@@ -263,29 +283,22 @@ class _ScannerScreenState extends State<ScannerScreen>
     );
   }
 
+  // ── Camera view ───────────────────────────────────────────────────────────
+
   Widget _buildCameraView() {
     final controller = _cameraController!;
 
-    // controller.value.aspectRatio is the RAW sensor ratio (landscape, e.g. 1.77).
-    // The camera plugin rotates the preview to match device orientation, so on a
-    // portrait device the effective display ratio is the INVERSE (e.g. 0.56).
-    // We must use the inverted value so our overlay SizedBox matches what is
-    // actually rendered on screen.
-    final rawRatio    = controller.value.aspectRatio; // sensor: w/h (>1 on most phones)
+    final rawRatio    = controller.value.aspectRatio;
     final screenSize  = MediaQuery.of(context).size;
     final isPortrait  = screenSize.height > screenSize.width;
-
-    // Effective preview ratio as it appears on screen
     final previewRatio = isPortrait ? (1.0 / rawRatio) : rawRatio;
     final screenRatio  = screenSize.width / screenSize.height;
 
     double previewW, previewH;
     if (screenRatio > previewRatio) {
-      // Screen is wider than preview → preview fills height, pillarboxed
       previewH = screenSize.height;
       previewW = previewH * previewRatio;
     } else {
-      // Screen is taller than preview → preview fills width, letterboxed
       previewW = screenSize.width;
       previewH = previewW / previewRatio;
     }
@@ -293,41 +306,39 @@ class _ScannerScreenState extends State<ScannerScreen>
     return Stack(
       fit: StackFit.expand,
       children: [
-        // ── Camera preview ──
         CameraPreview(controller),
 
-        // ── Detection overlay — sized & centred to match the preview rect ──
         if (_detectedObjects.isNotEmpty && _imageSize != null)
           Center(
             child: SizedBox(
-              width:  previewW,
+              width: previewW,
               height: previewH,
               child: CustomPaint(
                 painter: DocumentOverlayPainter(
                   detectedObjects: _detectedObjects,
                   absoluteImageSize: _imageSize!,
                   rotation: _rotation,
-                  isFrontCamera: _cameras![_selectedCameraIndex].lensDirection ==
-                      CameraLensDirection.front,
+                  isFrontCamera: false,
                 ),
               ),
             ),
           ),
 
-        // ── Viewfinder guide (when nothing detected) ──
         if (_detectedObjects.isEmpty) _buildViewfinderGuide(),
 
-        // ── Top bar ──
+        // White flash on capture
+        if (_isCapturing)
+          const ColoredBox(color: Colors.white24,
+              child: SizedBox.expand()),
+
         _buildTopBar(),
-
-        // ── Bottom bar ──
         _buildBottomBar(),
-
-        // ── Detection status pill ──
         _buildStatusPill(),
       ],
     );
   }
+
+  // ── Viewfinder guide ──────────────────────────────────────────────────────
 
   Widget _buildViewfinderGuide() {
     return Center(
@@ -337,9 +348,7 @@ class _ScannerScreenState extends State<ScannerScreen>
         child: DecoratedBox(
           decoration: BoxDecoration(
             border: Border.all(
-              color: Colors.white.withOpacity(0.25),
-              width: 1,
-            ),
+                color: Colors.white.withOpacity(0.25), width: 1),
             borderRadius: BorderRadius.circular(8),
           ),
           child: const Center(
@@ -349,15 +358,12 @@ class _ScannerScreenState extends State<ScannerScreen>
                 Icon(Icons.document_scanner_outlined,
                     color: Colors.white38, size: 40),
                 SizedBox(height: 10),
-                Text(
-                  'Point at a document',
-                  style: TextStyle(
-                    color: Colors.white38,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w400,
-                    letterSpacing: 0.3,
-                  ),
-                ),
+                Text('Point at a document',
+                    style: TextStyle(
+                        color: Colors.white38,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w400,
+                        letterSpacing: 0.3)),
               ],
             ),
           ),
@@ -366,17 +372,15 @@ class _ScannerScreenState extends State<ScannerScreen>
     );
   }
 
+  // ── Top bar ───────────────────────────────────────────────────────────────
+
   Widget _buildTopBar() {
     return Positioned(
-      top: 0,
-      left: 0,
-      right: 0,
+      top: 0, left: 0, right: 0,
       child: Container(
         padding: EdgeInsets.only(
           top: MediaQuery.of(context).padding.top + 8,
-          left: 16,
-          right: 16,
-          bottom: 12,
+          left: 16, right: 16, bottom: 12,
         ),
         decoration: BoxDecoration(
           gradient: LinearGradient(
@@ -387,29 +391,26 @@ class _ScannerScreenState extends State<ScannerScreen>
         ),
         child: Row(
           children: [
-            const SizedBox(
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.document_scanner, color: Color(0xFF00E676), size: 20),
-                  SizedBox(width: 8),
-                  Text(
-                    'Doc Scanner',
+            const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.document_scanner,
+                    color: Color(0xFF00E676), size: 20),
+                SizedBox(width: 8),
+                Text('Doc Scanner',
                     style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: 0.3,
-                    ),
-                  ),
-                ],
-              ),
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.3)),
+              ],
             ),
             const Spacer(),
-            // Flash toggle
-            _IconButton(
+            _RoundIconButton(
               icon: _isFlashOn ? Icons.flash_on : Icons.flash_off,
-              color: _isFlashOn ? const Color(0xFFFFD600) : Colors.white70,
+              color: _isFlashOn
+                  ? const Color(0xFFFFD600)
+                  : Colors.white70,
               onTap: _toggleFlash,
               tooltip: 'Toggle flash',
             ),
@@ -419,50 +420,131 @@ class _ScannerScreenState extends State<ScannerScreen>
     );
   }
 
-  Widget _buildBottomBar() {
-    final hasMultipleCameras = (_cameras?.length ?? 0) > 1;
+  // ── Bottom bar ────────────────────────────────────────────────────────────
 
+  Widget _buildBottomBar() {
     return Positioned(
-      bottom: 0,
-      left: 0,
-      right: 0,
+      bottom: 0, left: 0, right: 0,
       child: Container(
         padding: EdgeInsets.only(
           bottom: MediaQuery.of(context).padding.bottom + 20,
-          top: 20,
-          left: 24,
-          right: 24,
+          top: 16, left: 24, right: 24,
         ),
         decoration: BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.bottomCenter,
             end: Alignment.topCenter,
-            colors: [Colors.black.withOpacity(0.75), Colors.transparent],
+            colors: [Colors.black.withOpacity(0.85), Colors.transparent],
           ),
         ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            if (hasMultipleCameras)
-              _IconButton(
-                icon: Icons.flip_camera_ios_outlined,
-                color: Colors.white,
-                onTap: _switchCamera,
-                tooltip: 'Switch camera',
-                size: 28,
-              ),
+            // Tray — only visible after first capture
+            if (_session.isNotEmpty) ...[
+              _buildCaptureTray(),
+              const SizedBox(height: 16),
+            ],
+
+            // Action row
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                // Left — back
+                _RoundIconButton(
+                  icon: Icons.arrow_back,
+                  color: Colors.white,
+                  onTap: _goBack,
+                  tooltip: 'Back',
+                ),
+
+                // Centre — shutter
+                CaptureButton(
+                  onTap: _captureImage,
+                  enabled: !_isCapturing,
+                ),
+
+                // Right — complete pill
+                _CompletePill(
+                  onTap: _session.isNotEmpty ? _onComplete : null,
+                ),
+              ],
+            ),
           ],
         ),
       ),
     );
   }
 
+  // ── Capture tray ──────────────────────────────────────────────────────────
+
+  Widget _buildCaptureTray() {
+    final last  = _session.lastPage!;
+    final count = _session.count;
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Stack(
+          clipBehavior: Clip.none,
+          children: [
+            // Thumbnail
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: Image.file(
+                last.rawFile,
+                width: 48,
+                height: 64,
+                fit: BoxFit.cover,
+              ),
+            ),
+            // Count badge
+            Positioned(
+              top: -7,
+              right: -7,
+              child: Container(
+                width: 20,
+                height: 20,
+                decoration: const BoxDecoration(
+                  color: Color(0xFF00E676),
+                  shape: BoxShape.circle,
+                ),
+                child: Center(
+                  child: Text(
+                    '$count',
+                    style: const TextStyle(
+                      color: Colors.black,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(width: 10),
+        Text(
+          count == 1 ? '1 page captured' : '$count pages captured',
+          style: const TextStyle(
+            color: Colors.white70,
+            fontSize: 13,
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ── Status pill ───────────────────────────────────────────────────────────
+
   Widget _buildStatusPill() {
-    final count = _detectedObjects.length;
-    final isDetecting = count > 0;
+    final isDetecting = _detectedObjects.isNotEmpty;
 
     return Positioned(
-      bottom: MediaQuery.of(context).padding.bottom + 88,
+      // Sits above the bottom bar; when tray is visible the bar is taller
+      bottom: MediaQuery.of(context).padding.bottom +
+          (_session.isNotEmpty ? 185 : 130),
       left: 0,
       right: 0,
       child: Center(
@@ -487,8 +569,7 @@ class _ScannerScreenState extends State<ScannerScreen>
             children: [
               AnimatedContainer(
                 duration: const Duration(milliseconds: 250),
-                width: 6,
-                height: 6,
+                width: 6, height: 6,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: isDetecting
@@ -498,13 +579,11 @@ class _ScannerScreenState extends State<ScannerScreen>
               ),
               const SizedBox(width: 7),
               Text(
-                isDetecting
-                    ? count == 1
-                    ? '1 object detected'
-                    : '$count objects detected'
-                    : 'Scanning…',
+                isDetecting ? 'Document detected' : 'Scanning…',
                 style: TextStyle(
-                  color: isDetecting ? const Color(0xFF00E676) : Colors.white54,
+                  color: isDetecting
+                      ? const Color(0xFF00E676)
+                      : Colors.white54,
                   fontSize: 12,
                   fontWeight: FontWeight.w500,
                   letterSpacing: 0.3,
@@ -518,16 +597,54 @@ class _ScannerScreenState extends State<ScannerScreen>
   }
 }
 
-// ── Small reusable icon button ──────────────────────────────────────────────
+// ─────────────────────────── Shared widgets ────────────────────────────────
 
-class _IconButton extends StatelessWidget {
+class _CompletePill extends StatelessWidget {
+  final VoidCallback? onTap;
+  const _CompletePill({this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final active = onTap != null;
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+        decoration: BoxDecoration(
+          color: active
+              ? const Color(0xFF00E676).withOpacity(0.15)
+              : Colors.white10,
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(
+            color: active
+                ? const Color(0xFF00E676).withOpacity(0.6)
+                : Colors.white24,
+            width: 1.5,
+          ),
+        ),
+        child: Text(
+          'Complete',
+          style: TextStyle(
+            color: active ? const Color(0xFF00E676) : Colors.white38,
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.3,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RoundIconButton extends StatelessWidget {
   final IconData icon;
   final Color color;
   final VoidCallback onTap;
   final String tooltip;
   final double size;
 
-  const _IconButton({
+  const _RoundIconButton({
     required this.icon,
     required this.color,
     required this.onTap,
@@ -545,7 +662,7 @@ class _IconButton extends StatelessWidget {
         child: Container(
           width: 44,
           height: 44,
-          decoration: BoxDecoration(
+          decoration: const BoxDecoration(
             color: Colors.black26,
             shape: BoxShape.circle,
           ),

@@ -6,9 +6,9 @@ import 'dart:ui';
 
 class CameraUtils {
   static InputImage? cameraImageToInputImage(
-      CameraImage image,
-      CameraDescription camera,
-      ) {
+    CameraImage image,
+    CameraDescription camera,
+  ) {
     // ── 1. Determine rotation ──────────────────────────────────────────────
     final sensorOrientation = camera.sensorOrientation;
     InputImageRotation? rotation;
@@ -47,9 +47,9 @@ class CameraUtils {
   //
   // ML Kit only accepts NV21 on Android, so we always convert.
   static InputImage? _buildAndroid(
-      CameraImage image,
-      InputImageRotation rotation,
-      ) {
+    CameraImage image,
+    InputImageRotation rotation,
+  ) {
     final Uint8List nv21Bytes = _yuv420ToNv21(image);
 
     return InputImage.fromBytes(
@@ -148,9 +148,9 @@ class CameraUtils {
   // iOS always delivers BGRA8888 from the camera plugin — a single packed
   // plane that ML Kit accepts directly.
   static InputImage? _buildIOS(
-      CameraImage image,
-      InputImageRotation rotation,
-      ) {
+    CameraImage image,
+    InputImageRotation rotation,
+  ) {
     if (image.planes.isEmpty) {
       debugPrint("CameraUtils [iOS]: No planes in image.");
       return null;

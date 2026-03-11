@@ -1,27 +1,44 @@
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
-import 'dart:ui';
+import 'dart:ui' show Offset;
 import 'package:flutter/foundation.dart';
-import 'package:image/image.dart' as img;
-
+import 'package:opencv_dart/opencv_dart.dart' as cv;
 import '../screens/providers/capture_session.dart';
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Multi-pass document corner detector — pure Dart, background isolate.
+/// OpenCV-based document corner detector.
 ///
-/// Pipeline:
-///   1. Downscale → grayscale → bilateral-style blur (preserve edges)
-///   2. Canny-inspired edge map (Sobel + non-max suppression + hysteresis)
-///   3. Morphological close (dilate→erode) to connect broken edges
-///   4. Ignore a 3% image border to avoid frame edges
-///   5. Project edge pixels onto X and Y axes — find histogram peaks
-///   6. Pick the outermost strong peaks on each side as document boundaries
-///   7. Cross-validate: the four lines must form a plausible rectangle
-///   8. Fall back to Otsu bright-blob if line detection fails
+/// Full pipeline (runs in a background isolate — zero UI thread impact):
+///
+///   1.  Decode JPEG/PNG bytes with cv.imdecode
+///   2.  Downscale to ≤800 px longest side (speed + noise reduction)
+///   3.  Convert BGR → Grayscale
+///   4.  CLAHE (Contrast Limited Adaptive Histogram Equalisation)
+///       → dramatically improves edge visibility on dark/washed-out shots
+///   5.  GaussianBlur (5×5, σ=0) to suppress JPEG compression artefacts
+///   6.  Canny edge detection (auto-thresholds via Otsu on blurred image)
+///   7.  Morphological close (dilate × 2 → erode × 2, 5×5 kernel)
+///       → bridges gaps in document outlines
+///   8.  findContours (RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)
+///   9.  Sort contours by area descending, inspect top-10
+///  10.  approxPolyDP (ε = 2 % of arc length) on each candidate
+///  11.  Accept first contour that approximates to exactly 4 points
+///       and covers ≥ 15 % of image area (avoids tiny noise quads)
+///  12.  If no 4-point contour found: convexHull of largest contour
+///       then approxPolyDP again (handles partially occluded documents)
+///  13.  Order the 4 points as TL→TR→BR→BL
+///  14.  Scale back to original image pixel coordinates
+///  15.  Plausibility check — fall back to Otsu bright-blob if needed
+///  16.  Final fallback: 5% inset quad
 class EdgeDetectionService {
   static Future<CropQuad?> detectCorners(File imageFile) async {
     try {
       final bytes = await imageFile.readAsBytes();
-      return await compute(_pipeline, bytes);
+      // Run entirely in a separate isolate — never blocks the UI thread
+      return await Isolate.run(() => _opencvPipeline(bytes));
     } catch (e) {
       debugPrint('EdgeDetectionService: $e');
       return null;
@@ -30,352 +47,229 @@ class EdgeDetectionService {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Isolate entry
+// Main pipeline (runs in isolate)
 // ─────────────────────────────────────────────────────────────────────────────
 
-CropQuad _pipeline(Uint8List bytes) {
-  final original = img.decodeImage(bytes);
-  if (original == null) return _inset(100, 100);
+CropQuad? _opencvPipeline(Uint8List bytes) {
+  // ── 1. Decode ──────────────────────────────────────────────────────────────
+  final original = cv.imdecode(bytes, cv.IMREAD_COLOR);
+  if (original.isEmpty) return null;
 
-  final oW = original.width.toDouble();
-  final oH = original.height.toDouble();
+  final origH = original.rows.toDouble();
+  final origW = original.cols.toDouble();
 
-  // ── 1. Downscale to ~500px longest side ───────────────────────────────────
-  const work = 500;
-  final sc   = work / math.max(oW, oH);
-  final wW   = (oW * sc).round();
-  final wH   = (oH * sc).round();
-  final small = img.copyResize(original, width: wW, height: wH,
-      interpolation: img.Interpolation.average);
+  // ── 2. Downscale to ≤800 px longest side ──────────────────────────────────
+  const maxSide = 800;
+  final scale   = maxSide / math.max(origW, origH);
+  final wW      = (origW * scale).round();
+  final wH      = (origH * scale).round();
 
-  // ── 2. Grayscale + box blur (approximates bilateral for speed) ────────────
-  final grey    = img.grayscale(small);
-  final blurred = img.gaussianBlur(grey, radius: 2);
+  final small = cv.resize(original, (wW, wH));
 
-  // ── 3. Read luminance grid ────────────────────────────────────────────────
-  final lum = _readLum(blurred, wW, wH);
+  // ── 3. Grayscale ───────────────────────────────────────────────────────────
+  final grey = cv.cvtColor(small, cv.COLOR_BGR2GRAY);
 
-  // ── 4. Canny-style edge map ───────────────────────────────────────────────
-  final (mag, dir) = _sobelFull(lum, wW, wH);
-  final nms        = _nonMaxSuppression(mag, dir, wW, wH);
-  final edges      = _hysteresis(nms, wW, wH, loRatio: 0.25, hiRatio: 0.65);
+  // ── 4. CLAHE — boosts local contrast before edge detection ────────────────
+  //   clipLimit=2.0, tileGridSize=8×8 (standard document scanner values)
+  final clahe     = cv.createCLAHE(clipLimit: 2.0, tileGridSize: (8, 8));
+  final equalised = clahe.apply(grey);
 
-  // ── 5. Morphological close (3×3 dilation then erosion) ───────────────────
-  final closed = _morphClose(edges, wW, wH);
+  // ── 5. Gaussian blur ───────────────────────────────────────────────────────
+  final blurred = cv.gaussianBlur(equalised, (5, 5), 0);
 
-  // ── 6. Border exclusion — 3% on each side ────────────────────────────────
-  final bx = (wW * 0.03).round();
-  final by = (wH * 0.03).round();
-  for (int y = 0; y < wH; y++) {
-    for (int x = 0; x < wW; x++) {
-      if (x < bx || x >= wW - bx || y < by || y >= wH - by) {
-        closed[y * wW + x] = false;
+  // ── 6. Auto-threshold Canny ────────────────────────────────────────────────
+  //   Derive Canny thresholds from Otsu on the blurred image so they adapt
+  //   to each photo's contrast range automatically.
+  final (otsuThresh, _) = cv.threshold(
+      blurred, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
+  final lo    = otsuThresh * 0.5;  // hysteresis low  = 0.5 × Otsu
+  final hi    = otsuThresh;        // hysteresis high = Otsu
+  final edges = cv.canny(blurred, lo, hi);
+
+  // ── 7. Morphological close — bridge gaps in document outline ──────────────
+  final kernel  = cv.getStructuringElement(cv.MORPH_RECT, (5, 5));
+  final dilated = cv.dilate(edges, kernel, iterations: 2);
+  final closed  = cv.erode(dilated, kernel, iterations: 2);
+
+  // ── 8. Find external contours ─────────────────────────────────────────────
+  final (contours, _) = cv.findContours(
+      closed, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  if (contours.isEmpty) {
+    debugPrint('EdgeDetection: no contours found');
+    return _otsuFallback(bytes, origW, origH);
+  }
+
+  // ── 9. Sort by area descending, inspect top 10 ────────────────────────────
+  final minArea  = wW * wH * 0.15;  // must cover ≥ 15% of working image
+  final sorted   = contours.toList()
+    ..sort((a, b) => cv.contourArea(b).compareTo(cv.contourArea(a)));
+  final topN     = sorted.take(10).toList();
+
+  // ── 10–11. approxPolyDP — find the first 4-point contour ──────────────────
+  cv.VecPoint? quad4;
+
+  for (final contour in topN) {
+    final area = cv.contourArea(contour);
+    if (area < minArea) continue;
+
+    final peri   = cv.arcLength(contour, true);
+    final approx = cv.approxPolyDP(contour, 0.02 * peri, true);
+
+    if (approx.length == 4) {
+      quad4 = approx;
+      debugPrint('EdgeDetection ✓ 4-point contour (area=${area.toInt()})');
+      break;
+    }
+  }
+
+  // ── 12. Fallback: convexHull of largest contour → approxPolyDP ────────────
+  if (quad4 == null && topN.isNotEmpty) {
+    final largest  = topN.first;
+    final hull     = cv.convexHull(largest);
+    final peri     = cv.arcLength(hull as cv.VecPoint, true);
+
+    // Try progressively looser epsilons until we get 4 points
+    for (final eps in [0.02, 0.04, 0.06, 0.08, 0.10]) {
+      final approx = cv.approxPolyDP(hull as cv.VecPoint, eps * peri, true);
+      if (approx.length == 4) {
+        quad4 = approx;
+        debugPrint('EdgeDetection ✓ hull fallback (eps=$eps)');
+        break;
       }
     }
   }
 
-  // ── 7. Axis projections → document boundaries ────────────────────────────
-  final bounds = _projectBoundaries(closed, wW, wH);
+  // ── 13. Order 4 points TL → TR → BR → BL ─────────────────────────────────
+  if (quad4 != null && quad4.length == 4) {
+    final pts     = quad4.toList();
+    final ordered = _orderPoints(pts);
 
-  // ── 8. Cross-validate rectangle ──────────────────────────────────────────
-  if (bounds != null && _isPlausibleRect(bounds, wW, wH)) {
-    final sx = oW / wW;
-    final sy = oH / wH;
-    debugPrint('EdgeDetection ✓ '
-        'L=${(bounds.l*sx).toInt()} T=${(bounds.t*sy).toInt()} '
-        'R=${(bounds.r*sx).toInt()} B=${(bounds.b*sy).toInt()}');
-    return CropQuad(
-      topLeft:     Offset(bounds.l * sx, bounds.t * sy),
-      topRight:    Offset(bounds.r * sx, bounds.t * sy),
-      bottomRight: Offset(bounds.r * sx, bounds.b * sy),
-      bottomLeft:  Offset(bounds.l * sx, bounds.b * sy),
+    // ── 14. Scale back to original coords ─────────────────────────────────
+    final sx = origW / wW;
+    final sy = origH / wH;
+
+    final result = CropQuad(
+      topLeft:     Offset(ordered[0].x * sx, ordered[0].y * sy),
+      topRight:    Offset(ordered[1].x * sx, ordered[1].y * sy),
+      bottomRight: Offset(ordered[2].x * sx, ordered[2].y * sy),
+      bottomLeft:  Offset(ordered[3].x * sx, ordered[3].y * sy),
     );
+
+    // ── 15. Plausibility check ─────────────────────────────────────────────
+    if (_isPlausible(result, origW, origH)) {
+      debugPrint('EdgeDetection final: '
+          'TL=(${result.topLeft.dx.toInt()},${result.topLeft.dy.toInt()}) '
+          'TR=(${result.topRight.dx.toInt()},${result.topRight.dy.toInt()}) '
+          'BR=(${result.bottomRight.dx.toInt()},${result.bottomRight.dy.toInt()}) '
+          'BL=(${result.bottomLeft.dx.toInt()},${result.bottomLeft.dy.toInt()})');
+      return result;
+    }
+    debugPrint('EdgeDetection: failed plausibility check');
   }
 
-  // ── 9. Fallback: Otsu bright-blob ─────────────────────────────────────────
-  debugPrint('EdgeDetection: line detection failed, trying blob fallback');
-  final blob = _otsuBlob(lum, wW, wH, bx, by);
-  if (blob != null && _isPlausibleRect(blob, wW, wH)) {
-    final sx = oW / wW;
-    final sy = oH / wH;
-    debugPrint('EdgeDetection blob ✓');
-    return CropQuad(
-      topLeft:     Offset(blob.l * sx, blob.t * sy),
-      topRight:    Offset(blob.r * sx, blob.t * sy),
-      bottomRight: Offset(blob.r * sx, blob.b * sy),
-      bottomLeft:  Offset(blob.l * sx, blob.b * sy),
-    );
-  }
-
-  debugPrint('EdgeDetection: both passes failed → inset fallback');
-  return _inset(oW, oH);
+  // ── 16. Final fallback ─────────────────────────────────────────────────────
+  debugPrint('EdgeDetection: all passes failed → Otsu fallback');
+  return _otsuFallback(bytes, origW, origH);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Luminance reader
+// Point ordering — TL, TR, BR, BL
 // ─────────────────────────────────────────────────────────────────────────────
 
-List<int> _readLum(img.Image g, int w, int h) {
-  final out = List<int>.filled(w * h, 0);
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      out[y * w + x] = g.getPixel(x, y).r.toInt();
-    }
-  }
-  return out;
-}
+/// Orders 4 points as: topLeft, topRight, bottomRight, bottomLeft.
+///
+/// Algorithm:
+///   • Sort by (x+y): smallest = TL, largest = BR
+///   • Sort remainder by (y-x): smallest = TR, largest = BL
+List<cv.Point> _orderPoints(List<cv.Point> pts) {
+  // Sum x+y
+  pts.sort((a, b) => (a.x + a.y).compareTo(b.x + b.y));
+  final tl = pts[0];
+  final br = pts[3];
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Sobel — returns magnitude and quantised direction (0/45/90/135 degrees)
-// ─────────────────────────────────────────────────────────────────────────────
+  // Difference y-x for the remaining two
+  final rest = [pts[1], pts[2]];
+  rest.sort((a, b) => (a.y - a.x).compareTo(b.y - b.x));
+  final tr = rest[0];
+  final bl = rest[1];
 
-(List<double>, List<int>) _sobelFull(List<int> lum, int w, int h) {
-  final mag = List<double>.filled(w * h, 0);
-  final dir = List<int>.filled(w * h, 0); // 0,1,2,3 = 0°,45°,90°,135°
-
-  int px(int x, int y) => lum[y.clamp(0,h-1) * w + x.clamp(0,w-1)];
-
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      final gx = -px(x-1,y-1) + px(x+1,y-1)
-          -2*px(x-1,y)  + 2*px(x+1,y)
-          -px(x-1,y+1) + px(x+1,y+1);
-      final gy = -px(x-1,y-1) - 2*px(x,y-1) - px(x+1,y-1)
-          +px(x-1,y+1) + 2*px(x,y+1) + px(x+1,y+1);
-
-      mag[y*w+x] = math.sqrt(gx*gx + gy*gy.toDouble());
-
-      // Quantise angle to 0/45/90/135
-      final angle = math.atan2(gy.toDouble(), gx.toDouble()) * 180 / math.pi;
-      final a = (angle < 0 ? angle + 180 : angle);
-      dir[y*w+x] = a < 22.5 || a >= 157.5 ? 0
-          : a < 67.5  ? 1
-          : a < 112.5 ? 2
-          : 3;
-    }
-  }
-  return (mag, dir);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Non-maximum suppression — thin edges to single-pixel width
-// ─────────────────────────────────────────────────────────────────────────────
-
-List<double> _nonMaxSuppression(List<double> mag, List<int> dir, int w, int h) {
-  final out = List<double>.filled(w * h, 0);
-  double m(int x, int y) => (x<0||x>=w||y<0||y>=h) ? 0 : mag[y*w+x];
-
-  for (int y = 1; y < h-1; y++) {
-    for (int x = 1; x < w-1; x++) {
-      final v = mag[y*w+x];
-      double n1, n2;
-      switch (dir[y*w+x]) {
-        case 0:  n1 = m(x-1,y); n2 = m(x+1,y);
-        case 1:  n1 = m(x-1,y+1); n2 = m(x+1,y-1);
-        case 2:  n1 = m(x,y-1); n2 = m(x,y+1);
-        default: n1 = m(x-1,y-1); n2 = m(x+1,y+1);
-      }
-      out[y*w+x] = (v >= n1 && v >= n2) ? v : 0;
-    }
-  }
-  return out;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Hysteresis thresholding — strong edges stay, weak edges only if connected
-// ─────────────────────────────────────────────────────────────────────────────
-
-List<bool> _hysteresis(List<double> nms, int w, int h,
-    {required double loRatio, required double hiRatio}) {
-  double maxV = 0;
-  for (final v in nms) if (v > maxV) maxV = v;
-
-  final hi = maxV * hiRatio;
-  final lo = maxV * loRatio;
-
-  final strong = List<bool>.filled(w * h, false);
-  final weak   = List<bool>.filled(w * h, false);
-  for (int i = 0; i < w * h; i++) {
-    if (nms[i] >= hi) strong[i] = true;
-    else if (nms[i] >= lo) weak[i] = true;
-  }
-
-  // BFS: promote weak pixels connected to strong pixels
-  final out   = List<bool>.from(strong);
-  final queue = <int>[];
-  for (int i = 0; i < w * h; i++) {
-    if (strong[i]) queue.add(i);
-  }
-
-  while (queue.isNotEmpty) {
-    final idx = queue.removeLast();
-    final x = idx % w;
-    final y = idx ~/ w;
-    for (int dy = -1; dy <= 1; dy++) {
-      for (int dx = -1; dx <= 1; dx++) {
-        if (dx == 0 && dy == 0) continue;
-        final nx = x + dx;
-        final ny = y + dy;
-        if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
-        final ni = ny * w + nx;
-        if (weak[ni] && !out[ni]) {
-          out[ni] = true;
-          queue.add(ni);
-        }
-      }
-    }
-  }
-  return out;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Morphological close (dilate + erode with 3×3 kernel)
-// ─────────────────────────────────────────────────────────────────────────────
-
-List<bool> _morphClose(List<bool> src, int w, int h) {
-  // Dilate
-  final dilated = List<bool>.filled(w * h, false);
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      bool found = false;
-      outer:
-      for (int dy = -1; dy <= 1 && !found; dy++) {
-        for (int dx = -1; dx <= 1 && !found; dx++) {
-          final nx = x+dx; final ny = y+dy;
-          if (nx>=0&&nx<w&&ny>=0&&ny<h&&src[ny*w+nx]) found = true;
-        }
-      }
-      dilated[y*w+x] = found;
-    }
-  }
-  // Erode
-  final eroded = List<bool>.filled(w * h, false);
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      bool all = true;
-      outer:
-      for (int dy = -1; dy <= 1 && all; dy++) {
-        for (int dx = -1; dx <= 1 && all; dx++) {
-          final nx = x+dx; final ny = y+dy;
-          if (nx<0||nx>=w||ny<0||ny>=h||!dilated[ny*w+nx]) all = false;
-        }
-      }
-      eroded[y*w+x] = all;
-    }
-  }
-  return eroded;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Axis projection — find document boundaries from edge density histograms
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _Bounds {
-  final double l, t, r, b;
-  const _Bounds(this.l, this.t, this.r, this.b);
-}
-
-_Bounds? _projectBoundaries(List<bool> edges, int w, int h) {
-  // Build row and column density histograms
-  final colHist = List<int>.filled(w, 0);
-  final rowHist = List<int>.filled(h, 0);
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      if (edges[y*w+x]) { colHist[x]++; rowHist[y]++; }
-    }
-  }
-
-  // Smooth histograms with a 5-tap box filter to merge nearby peaks
-  List<double> smooth(List<int> hist) {
-    final s = List<double>.filled(hist.length, 0);
-    for (int i = 0; i < hist.length; i++) {
-      double sum = 0; int cnt = 0;
-      for (int d = -2; d <= 2; d++) {
-        final j = i + d;
-        if (j >= 0 && j < hist.length) { sum += hist[j]; cnt++; }
-      }
-      s[i] = sum / cnt;
-    }
-    return s;
-  }
-
-  final sc = smooth(colHist);
-  final sr = smooth(rowHist);
-
-  // Dynamic threshold = mean + 0.5 * std of smoothed histogram
-  double dynThreshold(List<double> h2) {
-    final mean = h2.reduce((a,b) => a+b) / h2.length;
-    final variance = h2.map((v) => (v-mean)*(v-mean))
-        .reduce((a,b) => a+b) / h2.length;
-    return mean + 0.5 * math.sqrt(variance);
-  }
-
-  final cThr = dynThreshold(sc);
-  final rThr = dynThreshold(sr);
-
-  // Find outermost peaks that exceed threshold (scan inward from borders)
-  int? left, right, top, bottom;
-  for (int x = 0; x < w; x++)   { if (sc[x] > cThr) { left  = x; break; } }
-  for (int x = w-1; x >= 0; x--){ if (sc[x] > cThr) { right = x; break; } }
-  for (int y = 0; y < h; y++)   { if (sr[y] > rThr) { top   = y; break; } }
-  for (int y = h-1; y >= 0; y--){ if (sr[y] > rThr) { bottom = y; break; } }
-
-  if (left==null||right==null||top==null||bottom==null) return null;
-  return _Bounds(left.toDouble(), top.toDouble(),
-      right.toDouble(), bottom.toDouble());
+  return [tl, tr, br, bl];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Plausibility check
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool _isPlausibleRect(_Bounds b, int w, int h) {
-  final bw = b.r - b.l;
-  final bh = b.b - b.t;
-  return bw > w * 0.2 && bh > h * 0.2  // must be at least 20% of image
-      && bw < w * 0.99 && bh < h * 0.99; // must not be the full frame
+bool _isPlausible(CropQuad q, double w, double h) {
+  // Compute bounding box of the quad
+  final xs = [q.topLeft.dx, q.topRight.dx, q.bottomRight.dx, q.bottomLeft.dx];
+  final ys = [q.topLeft.dy, q.topRight.dy, q.bottomRight.dy, q.bottomLeft.dy];
+  final bw = xs.reduce(math.max) - xs.reduce(math.min);
+  final bh = ys.reduce(math.max) - ys.reduce(math.min);
+
+  // Must cover at least 15% and not exceed 99% in both dimensions
+  return bw > w * 0.15 && bh > h * 0.15
+      && bw < w * 0.99 && bh < h * 0.99;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Otsu bright-blob fallback
+// Otsu bright-blob fallback (pure Dart — no OpenCV needed here)
 // ─────────────────────────────────────────────────────────────────────────────
 
-_Bounds? _otsuBlob(List<int> lum, int w, int h, int bx, int by) {
-  // Otsu threshold
-  final hist = List<int>.filled(256, 0);
-  for (final p in lum) hist[p]++;
-  final total = lum.length;
-  double sumAll = 0;
-  for (int i = 0; i < 256; i++) sumAll += i * hist[i];
+CropQuad _otsuFallback(Uint8List bytes, double origW, double origH) {
+  try {
+    // Re-use the already-decoded bytes — decode to grayscale
+    final grey = cv.imdecode(bytes, cv.IMREAD_GRAYSCALE);
 
-  double sumB = 0; int wB = 0;
-  double maxVar = 0; int thr = 128;
-  for (int t = 0; t < 256; t++) {
-    wB += hist[t];
-    if (wB == 0 || wB == total) continue;
-    sumB += t * hist[t];
-    final mB = sumB / wB;
-    final mF = (sumAll - sumB) / (total - wB);
-    final v  = wB * (total - wB) * (mB - mF) * (mB - mF);
-    if (v > maxVar) { maxVar = v; thr = t; }
-  }
+    // Downscale for speed
+    const maxSide = 400;
+    final sc  = maxSide / math.max(origW, origH);
+    final wW  = (origW * sc).round();
+    final wH  = (origH * sc).round();
+    final small = cv.resize(grey, (wW, wH));
 
-  // Find bounding box of bright pixels (excluding border)
-  int? minX, maxX, minY, maxY;
-  for (int y = by; y < h - by; y++) {
-    for (int x = bx; x < w - bx; x++) {
-      if (lum[y*w+x] >= thr) {
-        if (minX == null || x < minX) minX = x;
-        if (maxX == null || x > maxX) maxX = x;
-        if (minY == null || y < minY) minY = y;
-        if (maxY == null || y > maxY) maxY = y;
+    // Otsu threshold
+    final (_, mask) = cv.threshold(
+        small, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
+
+    // Border exclusion — zero a 4% strip
+    final bx = (wW * 0.04).round();
+    final by = (wH * 0.04).round();
+    cv.rectangle(mask, cv.Rect(0, 0, wW, by),     cv.Scalar.black, thickness: -1);
+    cv.rectangle(mask, cv.Rect(0, wH-by, wW, by), cv.Scalar.black, thickness: -1);
+    cv.rectangle(mask, cv.Rect(0, 0, bx, wH),     cv.Scalar.black, thickness: -1);
+    cv.rectangle(mask, cv.Rect(wW-bx, 0, bx, wH), cv.Scalar.black, thickness: -1);
+
+    final (contours, _) = cv.findContours(
+        mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    if (contours.isNotEmpty) {
+      final sorted  = contours.toList()
+        ..sort((a, b) => cv.contourArea(b).compareTo(cv.contourArea(a)));
+      final bbox    = cv.boundingRect(sorted.first);
+
+      final sx = origW / wW;
+      final sy = origH / wH;
+
+      final quad = CropQuad(
+        topLeft:     Offset(bbox.x * sx,              bbox.y * sy),
+        topRight:    Offset((bbox.x + bbox.width) * sx, bbox.y * sy),
+        bottomRight: Offset((bbox.x + bbox.width) * sx, (bbox.y + bbox.height) * sy),
+        bottomLeft:  Offset(bbox.x * sx,              (bbox.y + bbox.height) * sy),
+      );
+
+      if (_isPlausible(quad, origW, origH)) {
+        debugPrint('EdgeDetection: Otsu fallback succeeded');
+        return quad;
       }
     }
+  } catch (e) {
+    debugPrint('EdgeDetection: Otsu fallback error — $e');
   }
 
-  if (minX==null) return null;
-  return _Bounds(minX.toDouble(), minY!.toDouble(),
-      maxX!.toDouble(), maxY!.toDouble());
+  debugPrint('EdgeDetection: using final inset fallback');
+  return _inset(origW, origH);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -383,8 +277,8 @@ _Bounds? _otsuBlob(List<int> lum, int w, int h, int bx, int by) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 CropQuad _inset(double w, double h, [double margin = 0.05]) => CropQuad(
-  topLeft:     Offset(w*margin,     h*margin),
-  topRight:    Offset(w*(1-margin), h*margin),
-  bottomRight: Offset(w*(1-margin), h*(1-margin)),
-  bottomLeft:  Offset(w*margin,     h*(1-margin)),
+  topLeft:     Offset(w * margin,       h * margin),
+  topRight:    Offset(w * (1 - margin), h * margin),
+  bottomRight: Offset(w * (1 - margin), h * (1 - margin)),
+  bottomLeft:  Offset(w * margin,       h * (1 - margin)),
 );

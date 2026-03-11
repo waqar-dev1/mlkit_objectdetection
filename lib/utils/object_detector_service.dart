@@ -44,7 +44,8 @@ class ObjectDetectorService {
     try {
       final objects = await _objectDetector!.processImage(inputImage);
       debugPrint("ProcessImage: Success! Found ${objects.length} objects.");
-      return objects;
+      final largest = objects.reduce((a, b) => _area(a) >= _area(b) ? a : b);
+      return [largest];
     } catch (e) {
       debugPrint("ProcessImage: Error processing frame: $e");
       return null;
@@ -52,7 +53,8 @@ class ObjectDetectorService {
       _isBusy = false;
     }
   }
-
+  double _area(DetectedObject obj) =>
+      obj.boundingBox.width * obj.boundingBox.height;
   Future<void> dispose() async {
     await _objectDetector?.close();
     _objectDetector = null;

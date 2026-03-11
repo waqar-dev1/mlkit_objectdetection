@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:ml_objecdetection/screens/HomeScreen.dart';
 import 'screens/scanner_screen.dart';
 
 void main() async {
@@ -23,7 +24,7 @@ class DocScannerApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: const ScannerScreen(),
+      home: const HomeScreen(),
     );
   }
 }

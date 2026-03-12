@@ -125,13 +125,23 @@ CropQuad? _opencvPipeline(Uint8List bytes) {
 
   // ── 12. Fallback: convexHull of largest contour → approxPolyDP ────────────
   if (quad4 == null && topN.isNotEmpty) {
-    final largest  = topN.first;
-    final hull     = cv.convexHull(largest);
-    final peri     = cv.arcLength(hull as cv.VecPoint, true);
+    final largest = topN.first;
 
-    // Try progressively looser epsilons until we get 4 points
+    // convexHull returns a Mat of points — extract into a VecPoint manually
+    final hullMat = cv.convexHull(largest, returnPoints: true);
+
+    final hullPoints = <cv.Point>[];
+    for (int i = 0; i < hullMat.rows; i++) {
+      final px = hullMat.at<int>(i, 0);
+      final py = hullMat.at<int>(i, 1);
+      hullPoints.add(cv.Point(px, py));
+    }
+    final hullVec = cv.VecPoint.fromList(hullPoints);
+
+    final peri = cv.arcLength(hullVec, true);
+
     for (final eps in [0.02, 0.04, 0.06, 0.08, 0.10]) {
-      final approx = cv.approxPolyDP(hull as cv.VecPoint, eps * peri, true);
+      final approx = cv.approxPolyDP(hullVec, eps * peri, true);
       if (approx.length == 4) {
         quad4 = approx;
         debugPrint('EdgeDetection ✓ hull fallback (eps=$eps)');

@@ -33,131 +33,159 @@ import '../screens/providers/capture_session.dart';
 ///  14.  Scale back to original image pixel coordinates
 ///  15.  Plausibility check — fall back to Otsu bright-blob if needed
 ///  16.  Final fallback: 5% inset quad
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
+
 class EdgeDetectionService {
   static Future<CropQuad?> detectCorners(File imageFile) async {
     try {
       final bytes = await imageFile.readAsBytes();
-      // Run entirely in a separate isolate — never blocks the UI thread
       return await Isolate.run(() => _opencvPipeline(bytes));
     } catch (e) {
-      debugPrint('EdgeDetectionService: $e');
+      debugPrint('EdgeDetectionService error: $e');
       return null;
     }
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main pipeline (runs in isolate)
+// Main pipeline
 // ─────────────────────────────────────────────────────────────────────────────
 
 CropQuad? _opencvPipeline(Uint8List bytes) {
-  // ── 1. Decode ──────────────────────────────────────────────────────────────
+  // ── 1. Decode original ────────────────────────────────────────────────────
   final original = cv.imdecode(bytes, cv.IMREAD_COLOR);
-  if (original.isEmpty) return null;
+  if (original.isEmpty) return _inset(100, 100);
 
-  final origH = original.rows.toDouble();
   final origW = original.cols.toDouble();
+  final origH = original.rows.toDouble();
 
-  // ── 2. Downscale to ≤800 px longest side ──────────────────────────────────
-  const maxSide = 800;
-  final scale   = maxSide / math.max(origW, origH);
-  final wW      = (origW * scale).round();
-  final wH      = (origH * scale).round();
-
+  // ── 2. Downscale to ≤640 px longest side ─────────────────────────────────
+  // 640 is enough for contour detection — smaller = faster + less noise
+  const maxSide = 640;
+  final scale = maxSide / math.max(origW, origH);
+  final wW = math.max(2, (origW * scale).round());
+  final wH = math.max(2, (origH * scale).round());
   final small = cv.resize(original, (wW, wH));
 
-  // ── 3. Grayscale ───────────────────────────────────────────────────────────
+  // ── 3. Grayscale ──────────────────────────────────────────────────────────
   final grey = cv.cvtColor(small, cv.COLOR_BGR2GRAY);
 
-  // ── 4. CLAHE — boosts local contrast before edge detection ────────────────
-  //   clipLimit=2.0, tileGridSize=8×8 (standard document scanner values)
-  final clahe     = cv.createCLAHE(clipLimit: 2.0, tileGridSize: (8, 8));
-  final equalised = clahe.apply(grey);
+  // ── 4. Bilateral filter — reduces noise while PRESERVING hard edges ───────
+  // This is better than Gaussian for document detection because it keeps
+  // the paper boundary sharp while smoothing internal texture.
+  // d=9, sigmaColor=75, sigmaSpace=75  (standard values)
+  final filtered = cv.bilateralFilter(grey, 9, 75, 75);
 
-  // ── 5. Gaussian blur ───────────────────────────────────────────────────────
-  final blurred = cv.gaussianBlur(equalised, (5, 5), 0);
+  // ── 5. Burn a black border (5%) onto the filtered image ───────────────────
+  // This definitively kills any frame-edge contours before Canny runs.
+  final borderX = (wW * 0.05).round();
+  final borderY = (wH * 0.05).round();
+  cv.rectangle(filtered, cv.Rect(0, 0, wW, borderY),
+      cv.Scalar.black, thickness: -1);
+  cv.rectangle(filtered, cv.Rect(0, wH - borderY, wW, borderY),
+      cv.Scalar.black, thickness: -1);
+  cv.rectangle(filtered, cv.Rect(0, 0, borderX, wH),
+      cv.Scalar.black, thickness: -1);
+  cv.rectangle(filtered, cv.Rect(wW - borderX, 0, borderX, wH),
+      cv.Scalar.black, thickness: -1);
 
-  // ── 6. Auto-threshold Canny ────────────────────────────────────────────────
-  //   Derive Canny thresholds from Otsu on the blurred image so they adapt
-  //   to each photo's contrast range automatically.
-  final (otsuThresh, _) = cv.threshold(
-      blurred, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
-  final lo    = otsuThresh * 0.5;  // hysteresis low  = 0.5 × Otsu
-  final hi    = otsuThresh;        // hysteresis high = Otsu
-  final edges = cv.canny(blurred, lo, hi);
+  // ── 6. Canny with clamped, sensible thresholds ────────────────────────────
+  // DO NOT use raw Otsu output as Canny thresholds — on a white paper Otsu
+  // is very high (200+) which makes Canny miss the paper outline entirely.
+  // Instead: compute median luminance and use the sigma method which is
+  // robust across dark rooms, bright rooms, and everything in between.
+  final median = _medianLuminance(filtered, wW, wH);
+  final lo = math.max(10.0,  (1.0 - 0.33) * median);  // never below 10
+  final hi = math.min(200.0, (1.0 + 0.33) * median);  // never above 200
+  final edges = cv.canny(filtered, lo, hi);
 
-  // ── 7. Morphological close — bridge gaps in document outline ──────────────
-  final kernel  = cv.getStructuringElement(cv.MORPH_RECT, (5, 5));
+  // ── 7. Morphological close — bridge gaps in the document outline ──────────
+  // Use a larger 7×7 kernel + 2 iterations to firmly close corner gaps.
+  final kernel  = cv.getStructuringElement(cv.MORPH_RECT, (7, 7));
   final dilated = cv.dilate(edges, kernel, iterations: 2);
-  final closed  = cv.erode(dilated, kernel, iterations: 2);
+  final closed  = cv.erode(dilated, kernel, iterations: 1);
 
-  // ── 8. Find external contours ─────────────────────────────────────────────
+  // ── 8. Also burn border on the closed edge map ────────────────────────────
+  cv.rectangle(closed, cv.Rect(0, 0, wW, borderY),
+      cv.Scalar.black, thickness: -1);
+  cv.rectangle(closed, cv.Rect(0, wH - borderY, wW, borderY),
+      cv.Scalar.black, thickness: -1);
+  cv.rectangle(closed, cv.Rect(0, 0, borderX, wH),
+      cv.Scalar.black, thickness: -1);
+  cv.rectangle(closed, cv.Rect(wW - borderX, 0, borderX, wH),
+      cv.Scalar.black, thickness: -1);
+
+  // ── 9. Find external contours ─────────────────────────────────────────────
   final (contours, _) = cv.findContours(
       closed, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-  if (contours.isEmpty) {
-    debugPrint('EdgeDetection: no contours found');
-    return _otsuFallback(bytes, origW, origH);
-  }
+  debugPrint('EdgeDetection: ${contours.length} contours found '
+      '(image=${wW}x${wH}, median=$median lo=${lo.toInt()} hi=${hi.toInt()})');
 
-  // ── 9. Sort by area descending, inspect top 10 ────────────────────────────
-  final minArea  = wW * wH * 0.15;  // must cover ≥ 15% of working image
-  final sorted   = contours.toList()
+  // ── 10. Score and rank contours ───────────────────────────────────────────
+  // Score = area — but also PENALISE quads that are suspiciously close to
+  // the image border (those are usually frame artefacts that slipped through)
+  final minArea = wW * wH * 0.10; // ≥ 10% of working image
+  final maxArea = wW * wH * 0.92; // ≤ 92% — must not be the full frame
+
+  final candidates = contours.toList().where((c) {
+    final a = cv.contourArea(c);
+    return a >= minArea && a <= maxArea;
+  }).toList()
     ..sort((a, b) => cv.contourArea(b).compareTo(cv.contourArea(a)));
-  final topN     = sorted.take(10).toList();
 
-  // ── 10–11. approxPolyDP — find the first 4-point contour ──────────────────
+  debugPrint('EdgeDetection: ${candidates.length} candidates after area filter');
+
+  // ── 11. Try approxPolyDP on top candidates ────────────────────────────────
   cv.VecPoint? quad4;
 
-  for (final contour in topN) {
-    final area = cv.contourArea(contour);
-    if (area < minArea) continue;
+  for (final contour in candidates.take(8)) {
+    final peri = cv.arcLength(contour, true);
 
-    final peri   = cv.arcLength(contour, true);
-    final approx = cv.approxPolyDP(contour, 0.02 * peri, true);
-
-    if (approx.length == 4) {
-      quad4 = approx;
-      debugPrint('EdgeDetection ✓ 4-point contour (area=${area.toInt()})');
-      break;
-    }
-  }
-
-  // ── 12. Fallback: convexHull of largest contour → approxPolyDP ────────────
-  if (quad4 == null && topN.isNotEmpty) {
-    final largest = topN.first;
-
-    // convexHull returns a Mat of points — extract into a VecPoint manually
-    final hullMat = cv.convexHull(largest, returnPoints: true);
-
-    final hullPoints = <cv.Point>[];
-    for (int i = 0; i < hullMat.rows; i++) {
-      final px = hullMat.at<int>(i, 0);
-      final py = hullMat.at<int>(i, 1);
-      hullPoints.add(cv.Point(px, py));
-    }
-    final hullVec = cv.VecPoint.fromList(hullPoints);
-
-    final peri = cv.arcLength(hullVec, true);
-
-    for (final eps in [0.02, 0.04, 0.06, 0.08, 0.10]) {
-      final approx = cv.approxPolyDP(hullVec, eps * peri, true);
+    // Try a range of epsilon values — stricter first, looser as fallback
+    for (final eps in [0.02, 0.03, 0.04, 0.05]) {
+      final approx = cv.approxPolyDP(contour, eps * peri, true);
       if (approx.length == 4) {
         quad4 = approx;
-        debugPrint('EdgeDetection ✓ hull fallback (eps=$eps)');
+        debugPrint('EdgeDetection ✓ 4-point poly '
+            '(eps=$eps area=${cv.contourArea(contour).toInt()})');
         break;
+      }
+    }
+    if (quad4 != null) break;
+  }
+
+  // ── 12. Loose-epsilon fallback directly on the largest candidate ─────────
+  // cv.convexHull in opencv_dart 2.x returns Mat, not VecPoint, so it cannot
+  // be passed to arcLength/approxPolyDP directly. Instead we skip convexHull
+  // and just run approxPolyDP with progressively looser epsilons on the
+  // contour itself — this achieves the same "simplify to 4 sides" goal.
+  if (quad4 == null && candidates.isNotEmpty) {
+    debugPrint('EdgeDetection: no 4-poly found, trying loose-epsilon fallback');
+    final contour = candidates.first;
+    final peri    = cv.arcLength(contour, true);
+
+    for (final eps in [0.06, 0.08, 0.10, 0.12, 0.15, 0.20]) {
+      final approx = cv.approxPolyDP(contour, eps * peri, true);
+      if (approx.length == 4) {
+        final area = cv.contourArea(approx);
+        if (area <= maxArea) {
+          quad4 = approx;
+          debugPrint('EdgeDetection ✓ loose-eps=$eps area=${area.toInt()}');
+          break;
+        }
       }
     }
   }
 
-  // ── 13. Order 4 points TL → TR → BR → BL ─────────────────────────────────
+  // ── 13–15. Order points, scale, plausibility ──────────────────────────────
   if (quad4 != null && quad4.length == 4) {
     final pts     = quad4.toList();
     final ordered = _orderPoints(pts);
-
-    // ── 14. Scale back to original coords ─────────────────────────────────
-    final sx = origW / wW;
-    final sy = origH / wH;
+    final sx      = origW / wW;
+    final sy      = origH / wH;
 
     final result = CropQuad(
       topLeft:     Offset(ordered[0].x * sx, ordered[0].y * sy),
@@ -166,41 +194,57 @@ CropQuad? _opencvPipeline(Uint8List bytes) {
       bottomLeft:  Offset(ordered[3].x * sx, ordered[3].y * sy),
     );
 
-    // ── 15. Plausibility check ─────────────────────────────────────────────
     if (_isPlausible(result, origW, origH)) {
-      debugPrint('EdgeDetection final: '
+      debugPrint('EdgeDetection ✓ final result: '
           'TL=(${result.topLeft.dx.toInt()},${result.topLeft.dy.toInt()}) '
           'TR=(${result.topRight.dx.toInt()},${result.topRight.dy.toInt()}) '
           'BR=(${result.bottomRight.dx.toInt()},${result.bottomRight.dy.toInt()}) '
           'BL=(${result.bottomLeft.dx.toInt()},${result.bottomLeft.dy.toInt()})');
       return result;
     }
-    debugPrint('EdgeDetection: failed plausibility check');
+    debugPrint('EdgeDetection: result failed plausibility — '
+        'BW=${((result.topRight.dx - result.topLeft.dx) / origW * 100).toStringAsFixed(1)}% '
+        'BH=${((result.bottomLeft.dy - result.topLeft.dy) / origH * 100).toStringAsFixed(1)}%');
   }
 
-  // ── 16. Final fallback ─────────────────────────────────────────────────────
-  debugPrint('EdgeDetection: all passes failed → Otsu fallback');
-  return _otsuFallback(bytes, origW, origH);
+  // ── 16. Otsu bright-blob fallback ─────────────────────────────────────────
+  debugPrint('EdgeDetection: main pipeline failed → Otsu fallback');
+  return _otsuFallback(filtered, wW, wH, origW, origH);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Median luminance (sigma thresholding for Canny)
+// ─────────────────────────────────────────────────────────────────────────────
+
+double _medianLuminance(cv.Mat grey, int w, int h) {
+  // Build a 256-bin histogram and find the 50th percentile
+  final hist = List<int>.filled(256, 0);
+  final total = w * h;
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      hist[grey.at<int>(y, x)]++;
+    }
+  }
+  int cumul = 0;
+  for (int i = 0; i < 256; i++) {
+    cumul += hist[i];
+    if (cumul >= total ~/ 2) return i.toDouble();
+  }
+  return 127.0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Point ordering — TL, TR, BR, BL
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Orders 4 points as: topLeft, topRight, bottomRight, bottomLeft.
-///
-/// Algorithm:
-///   • Sort by (x+y): smallest = TL, largest = BR
-///   • Sort remainder by (y-x): smallest = TR, largest = BL
 List<cv.Point> _orderPoints(List<cv.Point> pts) {
-  // Sum x+y
-  pts.sort((a, b) => (a.x + a.y).compareTo(b.x + b.y));
-  final tl = pts[0];
-  final br = pts[3];
+  final sorted = List<cv.Point>.from(pts)
+    ..sort((a, b) => (a.x + a.y).compareTo(b.x + b.y));
 
-  // Difference y-x for the remaining two
-  final rest = [pts[1], pts[2]];
-  rest.sort((a, b) => (a.y - a.x).compareTo(b.y - b.x));
+  final tl   = sorted[0];
+  final br   = sorted[3];
+  final rest = [sorted[1], sorted[2]]
+    ..sort((a, b) => (a.y - a.x).compareTo(b.y - b.x));
   final tr = rest[0];
   final bl = rest[1];
 
@@ -212,65 +256,56 @@ List<cv.Point> _orderPoints(List<cv.Point> pts) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool _isPlausible(CropQuad q, double w, double h) {
-  // Compute bounding box of the quad
   final xs = [q.topLeft.dx, q.topRight.dx, q.bottomRight.dx, q.bottomLeft.dx];
   final ys = [q.topLeft.dy, q.topRight.dy, q.bottomRight.dy, q.bottomLeft.dy];
   final bw = xs.reduce(math.max) - xs.reduce(math.min);
   final bh = ys.reduce(math.max) - ys.reduce(math.min);
 
-  // Must cover at least 15% and not exceed 99% in both dimensions
-  return bw > w * 0.15 && bh > h * 0.15
-      && bw < w * 0.99 && bh < h * 0.99;
+  // Must cover 10%–92% in both dimensions
+  // Upper bound 92% is the key fix — previous 99% was letting near-full-frame
+  // quads pass, which is exactly what was producing the bad TL=(6,47) result.
+  return bw > w * 0.10 && bh > h * 0.10
+      && bw < w * 0.92 && bh < h * 0.92;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Otsu bright-blob fallback (pure Dart — no OpenCV needed here)
+// Otsu bright-blob fallback
 // ─────────────────────────────────────────────────────────────────────────────
 
-CropQuad _otsuFallback(Uint8List bytes, double origW, double origH) {
+CropQuad _otsuFallback(
+    cv.Mat filtered, int wW, int wH, double origW, double origH) {
   try {
-    // Re-use the already-decoded bytes — decode to grayscale
-    final grey = cv.imdecode(bytes, cv.IMREAD_GRAYSCALE);
-
-    // Downscale for speed
-    const maxSide = 400;
-    final sc  = maxSide / math.max(origW, origH);
-    final wW  = (origW * sc).round();
-    final wH  = (origH * sc).round();
-    final small = cv.resize(grey, (wW, wH));
-
-    // Otsu threshold
+    // Re-use already filtered+border-burned grey image
     final (_, mask) = cv.threshold(
-        small, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
-
-    // Border exclusion — zero a 4% strip
-    final bx = (wW * 0.04).round();
-    final by = (wH * 0.04).round();
-    cv.rectangle(mask, cv.Rect(0, 0, wW, by),     cv.Scalar.black, thickness: -1);
-    cv.rectangle(mask, cv.Rect(0, wH-by, wW, by), cv.Scalar.black, thickness: -1);
-    cv.rectangle(mask, cv.Rect(0, 0, bx, wH),     cv.Scalar.black, thickness: -1);
-    cv.rectangle(mask, cv.Rect(wW-bx, 0, bx, wH), cv.Scalar.black, thickness: -1);
+        filtered, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
 
     final (contours, _) = cv.findContours(
         mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
     if (contours.isNotEmpty) {
-      final sorted  = contours.toList()
+      final sorted = contours.toList()
         ..sort((a, b) => cv.contourArea(b).compareTo(cv.contourArea(a)));
-      final bbox    = cv.boundingRect(sorted.first);
 
-      final sx = origW / wW;
-      final sy = origH / wH;
+      final maxArea = wW * wH * 0.92;
+      // Find largest contour that isn't the full image
+      final best = sorted.firstWhere(
+            (c) => cv.contourArea(c) <= maxArea,
+        orElse: () => sorted.first,
+      );
+
+      final bbox = cv.boundingRect(best);
+      final sx   = origW / wW;
+      final sy   = origH / wH;
 
       final quad = CropQuad(
-        topLeft:     Offset(bbox.x * sx,              bbox.y * sy),
-        topRight:    Offset((bbox.x + bbox.width) * sx, bbox.y * sy),
-        bottomRight: Offset((bbox.x + bbox.width) * sx, (bbox.y + bbox.height) * sy),
-        bottomLeft:  Offset(bbox.x * sx,              (bbox.y + bbox.height) * sy),
+        topLeft:     Offset(bbox.x * sx,                     bbox.y * sy),
+        topRight:    Offset((bbox.x + bbox.width) * sx,      bbox.y * sy),
+        bottomRight: Offset((bbox.x + bbox.width) * sx,      (bbox.y + bbox.height) * sy),
+        bottomLeft:  Offset(bbox.x * sx,                     (bbox.y + bbox.height) * sy),
       );
 
       if (_isPlausible(quad, origW, origH)) {
-        debugPrint('EdgeDetection: Otsu fallback succeeded');
+        debugPrint('EdgeDetection ✓ Otsu fallback succeeded');
         return quad;
       }
     }
@@ -278,12 +313,12 @@ CropQuad _otsuFallback(Uint8List bytes, double origW, double origH) {
     debugPrint('EdgeDetection: Otsu fallback error — $e');
   }
 
-  debugPrint('EdgeDetection: using final inset fallback');
+  debugPrint('EdgeDetection: all passes failed → inset fallback');
   return _inset(origW, origH);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helpers
+// Final fallback
 // ─────────────────────────────────────────────────────────────────────────────
 
 CropQuad _inset(double w, double h, [double margin = 0.05]) => CropQuad(

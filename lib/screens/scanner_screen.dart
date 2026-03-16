@@ -9,7 +9,9 @@ import '../painters/document_overlay_painter.dart';
 import '../utils/camera_utils.dart';
 import '../utils/object_detector_service.dart';
 import '../widgets/capture_button.dart';
+import 'EdgeDetectionDebugScreen.dart';
 import 'edit_session_screen.dart';
+import 'package:image_picker/image_picker.dart';
 
 class ScannerScreen extends StatefulWidget {
   const ScannerScreen({super.key});
@@ -24,6 +26,7 @@ class _ScannerScreenState extends State<ScannerScreen>
   CameraDescription? _backCamera;
   CameraController? _cameraController;
   bool _isCameraInitialized = false;
+  final ImagePicker _imagePicker = ImagePicker();
 
   // ── Detection ────────────────────────────────────────────────────────────
   final ObjectDetectorService _detectorService = ObjectDetectorService();
@@ -216,6 +219,37 @@ class _ScannerScreenState extends State<ScannerScreen>
     );
   }
 
+  Future<void> _goPickFromGallery() async {
+    // Open the system photo picker; user can select one or many images.
+    // Returns an empty list (never null) if the user dismisses without picking.
+    final List<XFile> picked = await _imagePicker.pickMultiImage(
+      imageQuality: 95,   // slight compression keeps file sizes sane
+      // while preserving enough detail for OCR / edge detection
+      requestFullMetadata: false, // faster on iOS; we don't need EXIF beyond path
+    );
+
+    if (picked.isEmpty) return; // user cancelled — stay on current screen
+
+    // Mirror exactly what _captureImage() does: wrap each XFile in a
+    // CapturedDocument and add it to the shared session.
+    for (final xfile in picked) {
+      final doc = CapturedDocument.fromXFile(xfile);
+      _session.addPage(doc);
+    }
+
+    // Navigate to the edit screen the same way _onComplete() does.
+    // Use pushReplacement so the user can't swipe back to the camera
+    // mid-edit (they can still tap the back arrow inside EditSessionScreen).
+    if (!mounted) return;
+    // Navigator.of(context).push(
+    //   MaterialPageRoute(
+    //     builder: (_) => EditSessionScreen(session: _session),
+    //   ),
+    // );
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => EdgeDetectionDebugScreen(session: _session),
+    ));
+  }
   // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
@@ -400,19 +434,11 @@ class _ScannerScreenState extends State<ScannerScreen>
         ),
         child: Row(
           children: [
-            const Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(Icons.document_scanner,
-                    color: Color(0xFF00E676), size: 20),
-                SizedBox(width: 8),
-                Text('Doc Scanner',
-                    style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: 0.3)),
-              ],
+            _RoundIconButton(
+              icon: Icons.close,
+              color: Colors.white,
+              onTap: _goBack,
+              tooltip: 'Back',
             ),
             const Spacer(),
             _RoundIconButton(
@@ -458,14 +484,13 @@ class _ScannerScreenState extends State<ScannerScreen>
             // Action row
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              crossAxisAlignment: CrossAxisAlignment.center,
+              //crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                // Left — back
                 _RoundIconButton(
-                  icon: Icons.arrow_back,
+                  icon: Icons.image,
                   color: Colors.white,
-                  onTap: _goBack,
-                  tooltip: 'Back',
+                  onTap: _goPickFromGallery,
+                  tooltip: 'GalleryPic',
                 ),
 
                 // Centre — shutter

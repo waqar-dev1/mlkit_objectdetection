@@ -40,7 +40,8 @@ dependencies:
   image: ^4.1.7               # pure-Dart pixel manipulation (crop, grayscale, contrast, etc.)
   path_provider: ^2.1.2       # write processed files to app temp dir
   opencv_dart: ^2.1.0          # OpenCV bindings — findContours + approxPolyDP
-
+  gal: ^2.3.0
+  share_plus: ^11.0.0
 
 dev_dependencies:
   flutter_test:

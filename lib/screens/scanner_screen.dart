@@ -306,7 +306,16 @@ class _ScannerScreenState extends State<ScannerScreen>
     return Stack(
       fit: StackFit.expand,
       children: [
-        CameraPreview(controller),
+        SizedBox.expand(
+          child: FittedBox(
+            fit: BoxFit.cover,
+            child: SizedBox(
+              width: controller.value.previewSize?.height ?? 1.0,
+              height: controller.value.previewSize?.width ?? 1.0,
+              child: CameraPreview(controller),
+            ),
+          ),
+        ),
 
         if (_detectedObjects.isNotEmpty && _imageSize != null)
           Center(
